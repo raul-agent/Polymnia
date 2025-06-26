@@ -1,0 +1,9 @@
+argparse
+opencv-python
+ultralytics
+praat-parselmouth
+moviepy
+pandas
+duckdb
+pyarrow
+git+https://github.com/m-bain/whisperx.git
