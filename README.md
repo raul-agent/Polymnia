@@ -5,6 +5,7 @@ Tengo que revisar en ecos.py que llame bien a Parole
 Instalador automático de TalkNet--ASD
 Direcotrio "dependences" que contenga los paquetes de Python (whisperX dentro de Python), R, TalkNet--ASD, Parole, OpenPose y PRAAT
 
+```text
 dependences/
 └── env/
     ├── pyenv/                         # entorno virtual de Python
@@ -28,3 +29,4 @@ dependences/
         ├── bin/                       # ejecutables (CPU/GPU)
         ├── models/                    # pesos de redes neuronales
         └── examples/                  # ejemplos de línea de comandos
+```
