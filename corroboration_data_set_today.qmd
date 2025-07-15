@@ -1,0 +1,209 @@
+---
+title: "Data Quality Report – multimodal alignment"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    code-summary: "Mostrar código"
+    code-overflow: wrap
+    theme: flatly
+    highlight-style: github
+    self-contained: true
+---
+
+# Corroboroation today
+
+```{r setup}
+library(dplyr)
+library(ggplot2)
+library(scales)
+# cualquier otro que uses
+load("multi_df.rda")
+```
+
+```{r}
+
+library(tidyverse)
+
+
+print(dim(multi_df))
+
+
+# Verificar proporción de valores válidos
+multi_df %>%
+  filter(!is.na(words) & words != "") %>%
+  summarise(
+    pitch_valid     = mean(!is.na(pitch)),
+    intensity_valid = mean(!is.na(intensity)),
+    keypoints_valid = mean(!is.na(nx) & !is.na(ny))
+  )
+# Resultado esperado:
+# pitch_valid     = 1
+# intensity_valid = 1
+# keypoints_valid ≈ 0.914
+
+# Detectar outliers extremos en coordenadas (OpenPose fallos)
+multi_df %>%
+  filter(abs(nx) > 5 | abs(ny) > 5) %>%
+  count(type_points, sort = TRUE)
+# Resultado típico:
+# type_points            n
+# pose_keypoints     776245
+# hand_right_keypoints 481638
+# etc.
+
+# Verificar proporción de palabras ausentes por ID
+multi_df %>%
+  group_by(id) %>%
+  summarise(
+    total_frames = n(),
+    missing_pitch = mean(is.na(pitch)),
+    missing_intensity = mean(is.na(intensity)),
+    missing_words = mean(is.na(words) | words == ""),
+    missing_nx = mean(is.na(nx)),
+    missing_ny = mean(is.na(ny))
+  ) %>%
+  arrange(desc(missing_words)) %>%
+  print(n = 10)
+
+```
+
+| Feature            | Status           | Notes                                                   |
+|----------------|----------------|-----------------------------------------|
+| Frame alignment    | ✅ OK            | Synchronization confirmed with animated overlays        |
+| Keypoints coverage | ⚠️ \~91.4% valid | Missing in \~8.6% of points (e.g. occlusion, low light) |
+| Pitch              | ✅ 100% valid    | No missing values in any frame                          |
+| Intensity          | ✅ 100% valid    | No missing values in any frame                          |
+| Word alignment     | ✅ Expected      | Gaps reflect silent frames or between-word regions      |
+| Outlier filtering  | ❌ Not yet       | Extreme keypoints present (e.g. `abs(nx/ny) > 5`)       |
+
+
+
+# Plots
+
+## Visual Inspection – Gesture and Prosody
+
+The following plot illustrates the synchronisation of vertical wrist movement (`ny`) with prosodic cues (intensity and pitch), using frame-based alignment.
+
+
+
+
+```{r}
+# ───────────────────────── parameters ──────────────────────────
+target_id     <- "2016-01-12_0100_US_KNBC_Channel_4_News_1171.022_1175.056_today"
+person_target <- 1
+n_frames      <- 120            # tweak length if desired
+out_width_cm  <- 14
+out_height_cm <- 18
+
+# ────────────────────── data preparation ───────────────────────
+library(dplyr); library(stringr); library(scales)
+
+df_id <- multi_df |>                       # multi_df already in memory
+  filter(id == target_id, people_id == person_target) |>
+  mutate(type = str_remove(type_points, "_keypoints$"),
+         type = recode(type,
+                       hand       = "hand_left",
+                       hand_left  = "hand_left",
+                       hand_right = "hand_right"),
+         frame = as.integer(frame)) |>
+  arrange(frame)
+
+frames_sel <- sort(unique(df_id$frame))[seq_len(n_frames)]
+
+df_sel <- df_id |>                          # keep only the subset
+  filter(frame %in% frames_sel) |>
+  mutate(frame_rel = frame - min(frame) + 1)  # zero-based time axis
+
+# wrist = right hand, point 0 (OpenPose convention)
+df_wrist <- df_sel |>
+  filter(type == "hand_right", points == 0) |>
+  select(frame_rel, ny, words) |>
+  mutate(words = ifelse(is.na(words) | words == "", "###", words)) |>
+  # order words by first appearance
+  mutate(words = factor(words, levels = unique(words)))
+
+df_int   <- df_sel |>
+  group_by(frame_rel) |>
+  summarise(intensity = mean(intensity, na.rm = TRUE), .groups = "drop") |>
+  mutate(int_norm = rescale(intensity, to = c(0, 1)))
+
+df_pitch <- df_sel |>
+  group_by(frame_rel) |>
+  summarise(pitch = mean(pitch, na.rm = TRUE), .groups = "drop") |>
+  mutate(pitch_norm = rescale(pitch, to = c(0, 1)))
+
+# ────────────────────────── plotting ───────────────────────────
+library(ggplot2); library(patchwork)
+
+p_wrist <- ggplot(df_wrist, aes(frame_rel, ny, colour = words)) +
+  geom_line(colour = "grey80") +
+  geom_point(size = 2) +
+  scale_colour_viridis_d(end = .85, option = "turbo") +
+  coord_cartesian(ylim = range(df_wrist$ny, na.rm = TRUE)) +
+  labs(title   = "Right-wrist vertical displacement",
+       y       = "ny (normalised)",
+       x       = "Frame",
+       colour  = "Word") +
+  theme_classic(base_size = 9) +
+  theme(legend.position = "bottom",
+        legend.title    = element_text(size = 8),
+        legend.key.size = unit(0.3, "cm"))
+
+p_int <- ggplot(df_int, aes(frame_rel, int_norm)) +
+  geom_line(colour = "orange", linewidth = 0.8) +
+  geom_point(colour = "orange", size = 1.5) +
+  labs(title = "Intensity (normalised)",
+       y     = "Intensity",
+       x     = "Frame") +
+  theme_classic(base_size = 9)
+
+p_pitch <- ggplot(df_pitch, aes(frame_rel, pitch_norm)) +
+  geom_line(colour = "steelblue", linewidth = 0.8) +
+  geom_point(colour = "steelblue", size = 1.5) +
+  labs(title = "Fundamental frequency (normalised)",
+       y     = "F0",
+       x     = "Frame") +
+  theme_classic(base_size = 9)
+
+fig_static <- p_wrist / p_int / p_pitch +
+  plot_annotation(
+    title    = "Synchrony of Gesture and Prosody",
+    subtitle = target_id,
+    theme    = theme(plot.title = element_text(size = 11, face = "bold"),
+                     plot.subtitle = element_text(size = 8))
+  )
+
+ggsave(sprintf("gesture_prosody_%s.png", target_id),
+       fig_static, width = out_width_cm, height = out_height_cm,
+       units = "cm", dpi = 300)
+
+
+
+```
+
+
+
+```{r}
+fig_static <- p_wrist / p_int / p_pitch +
+  plot_annotation(
+    title    = "Synchrony of Gesture and Prosody",
+    subtitle = target_id,
+    caption  = "Figure: Right wrist vertical movement across frames aligned with pitch and intensity (normalized). Color encodes spoken words in temporal order.",
+    theme    = theme(
+      plot.title    = element_text(size = 11, face = "bold"),
+      plot.subtitle = element_text(size = 8, margin = margin(b = 6)),
+      plot.caption  = element_text(size = 8, hjust = 0)
+    )
+  )
+```
+
+
+
+```{r}
+fig_static
+```
+
