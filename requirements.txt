@@ -1,9 +1,20 @@
+# Argument parsing
 argparse
+
+# Video and image processing
 opencv-python
-ultralytics
-praat-parselmouth
 moviepy
+
+# Pose estimation (YOLOv8)
+ultralytics
+
+# Prosodic analysis via Praat
+praat-parselmouth
+
+# Data handling and storage
 pandas
 duckdb
 pyarrow
+
+# Forced alignment and transcription (WhisperX)
 git+https://github.com/m-bain/whisperx.git
