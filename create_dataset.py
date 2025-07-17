@@ -22,7 +22,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 os.environ["PYTHON_SCRIPT_DIR"] = script_dir  # para los scripts R
 
 # Ajusta este path a tu instalación de TalkNet‑ASD
-ASD_PATH = "/home/brian/TalkNet-ASD"
+ASD_PATH = "/home/user/TalkNet-ASD"
 
 # ---------- utilidades comunes ------------------------------------------------
 
