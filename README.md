@@ -43,11 +43,11 @@ External dependencies:
 
 ## 1️⃣ `download_clips.py` — Download video clips from NewsScape
 
-Downloads `.mp4` video clips from `gallo.case.edu` based on a tabulated `.csv` file. Adds a configurable offset to clip timestamps. Retries failed downloads and logs errors.
+Downloads `.mp4` video clips from `gallo.case.edu` based on a tabulated `.txt` file. Adds a configurable offset to clip timestamps. Retries failed downloads and logs errors.
 
 **Inputs**:
 
-* `--csv_file`: Tab-separated file with clip metadata
+* `--txt_file`: Tab-separated file with clip metadata
 * `--searchterm`: Label for clip naming
 * `--offset`: Seconds before/after clip (default: 2.5)
 * `--output_dir`: Target folder for videos
@@ -56,7 +56,7 @@ Downloads `.mp4` video clips from `gallo.case.edu` based on a tabulated `.csv` f
 
 ```bash
 python3 download_clips.py \
-  --csv_file clips.txt \
+  --txt_file clips.txt \
   --searchterm climate_change \
   --output_dir ./output/videos/raw
 ```
@@ -219,7 +219,7 @@ output/
 * All modules are idempotent and modular — rerun safely with `--resume` or `--start_at_argos`.
 * Processing can be parallelized using `concurrent.futures` where applicable.
 * All logs and errors are saved for reproducibility.
-* This pipeline assumes a well-formed tabulated CSV and structured `.mp4` filenames.
+* This pipeline assumes a well-formed tabulated `txt` and structured `.mp4` filenames.
 
 
 
