@@ -1,251 +1,284 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Pipeline de creación de datasets multimodales:
+
+- Descarga clips y procesa con TalkNet‑ASD.
+- Filtra a un solo hablante y ejecuta Argos (OpenPose + dfMaker).
+- Genera parquet, análisis acústico (ecos / apate) y DuckDB.
+- Admite reanudación (--resume) y arranque directo en Argos (--start_at_argos).
+
+Autor: DaedalusLAB
+"""
+
 import argparse
 import os
 import concurrent.futures
 import sys
+import re 
 
-# Obtener la ruta del script Python
+# Ruta del propio script
 script_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["PYTHON_SCRIPT_DIR"] = script_dir  # para los scripts R
 
-# Definir la variable de entorno para el script R
-os.environ["PYTHON_SCRIPT_DIR"] = script_dir
-
+# Ajusta este path a tu instalación de TalkNet‑ASD
 ASD_PATH = "/home/brian/TalkNet-ASD"
 
-def run_command(command):
-    """
-    Ejecuta un comando con os.system (retorna el código de salida).
-    """
+# ---------- utilidades comunes ------------------------------------------------
+
+def run_command(command: str) -> int:
+    """Ejecuta un comando shell y devuelve su código de salida."""
     print(f"Ejecutando: {command}")
     return os.system(command)
 
-def check_json_generated(output_folder):
-    """
-    Comprueba si en output_folder/dataset/OpenPose existen carpetas con JSON_FILES.
-    """
+def check_json_generated(output_folder: str) -> bool:
+    """Devuelve True si existen carpetas JSON_FILES generadas por OpenPose."""
     openpose_dir = os.path.join(output_folder, "dataset", "OpenPose")
     if not os.path.exists(openpose_dir):
         return False
-    for video_name in os.listdir(openpose_dir):
-        video_dir = os.path.join(openpose_dir, video_name)
-        if os.path.isdir(video_dir):
-            json_folder = os.path.join(video_dir, "JSON_FILES")
-            if os.path.exists(json_folder):
-                return True
-    return False
+    return any(
+        os.path.isdir(os.path.join(openpose_dir, vid, "JSON_FILES"))
+        for vid in os.listdir(openpose_dir)
+    )
 
-def check_parquet_generated(output_folder):
-    """
-    Comprueba si existen archivos .parquet en output_folder/dataset/1_persons/parquet_files.
-    """
+def check_parquet_generated(output_folder: str) -> bool:
+    """Devuelve True si ya hay archivos .parquet generados."""
     parquet_dir = os.path.join(output_folder, "dataset", "1_persons", "parquet_files")
-    if os.path.exists(parquet_dir) and any(f.endswith('.parquet') for f in os.listdir(parquet_dir)):
-        return True
-    return False
+    return os.path.exists(parquet_dir) and any(
+        f.endswith(".parquet") for f in os.listdir(parquet_dir)
+    )
 
-def check_apate_ecos_done(output_folder):
-    """
-    Comprueba la existencia de archivos bandera que indican que se completaron ecos.py y apate.py.
-    """
-    apate_flag = os.path.join(output_folder, "apate_done.txt")
-    ecos_flag = os.path.join(output_folder, "ecos_done.txt")
-    return os.path.exists(apate_flag) and os.path.exists(ecos_flag)
+def mark_apate_ecos_done(output_folder: str) -> None:
+    """Crea los ficheros bandera que indican que ecos.py y apate.py terminaron bien."""
+    for flag in ("apate_done.txt", "ecos_done.txt"):
+        with open(os.path.join(output_folder, flag), "w") as f:
+            f.write("done")
 
-def mark_apate_ecos_done(output_folder):
-    """
-    Marca que ambos (apate y ecos) se completaron con éxito.
-    Esto se usa cuando se ejecutan en el modo completo (no-resume) y terminan bien.
-    """
-    with open(os.path.join(output_folder, "apate_done.txt"), "w") as f:
-        f.write("done")
-    with open(os.path.join(output_folder, "ecos_done.txt"), "w") as f:
-        f.write("done")
+def sanitize_filename(name: str) -> str:
+    """Reemplaza caracteres problemáticos para nombres de archivo."""
+    return re.sub(r"[^\w\-]", "_", name)
 
-def run_missing_scripts(output_folder):
-    """
-    En modo recuperación, si alguno de los dos scripts (apate.py o ecos.py)
-    no tiene su flag 'done', se lanza SOLO ese script.
-    Si faltan ambos, se lanzan en paralelo.
+# ---------- pasos condicionales ----------------------------------------------
 
-    - Si un script falla (código de salida != 0), NO se crea su flag.
-    - Si termina bien, se crea <nombre_script>_done.txt
+def run_argos_if_needed(output_folder: str) -> None:
     """
-    apate_flag = os.path.join(output_folder, "apate_done.txt")
-    ecos_flag = os.path.join(output_folder, "ecos_done.txt")
+    Ejecuta argos.py (OpenPose + dfMaker) si no existen JSON_FILES.
+    Es idempotente: si los JSON ya están, se omite.
+    """
+    if check_json_generated(output_folder):
+        print("Las carpetas JSON_FILES existen. Argos no es necesario.")
+        return
 
+    print("No se encontraron JSON_FILES. Lanzando argos.py...")
+    run_command(
+        "python3 argos.py "
+        f'--videos_folder "{os.path.join(output_folder, "videos", "1_person")}" '
+        f'--output_folder "{output_folder}" '
+        "--openpose_path /opt/openpose "
+        "--face_hands True "
+        "--skeletons True"
+    )
+
+def generate_parquet_if_needed(output_folder: str) -> None:
+    """
+    Genera los .parquet mediante max_people_classification.R
+    si hay JSON pero aún no existen los parquet.
+    """
+    if not check_json_generated(output_folder):
+        print("Aún no hay JSON; no se puede generar parquet.")
+        return
+    if check_parquet_generated(output_folder):
+        print("Parquet ya generados. Se omite Rscript.")
+        return
+
+    print("Generando archivos parquet con max_people_classification.R...")
+    dataset_dir = os.path.join(output_folder, "dataset")
+    openpose_dir = os.path.join(dataset_dir, "OpenPose")
+    for video_name in os.listdir(openpose_dir):
+        json_folder = os.path.join(openpose_dir, video_name, "JSON_FILES")
+        if os.path.exists(json_folder):
+            print(f"→ Rscript en {json_folder}")
+            run_command(
+                f'Rscript max_people_classification.R "{json_folder}" "{dataset_dir}"'
+            )
+
+def run_missing_voice_scripts(output_folder: str) -> None:
+    """
+    Ejecuta ecos.py y/o apate.py si aún no tienen su bandera 'done'.
+    """
     tasks = []
-    if not os.path.exists(apate_flag):
-        tasks.append(("apate", f'python3 apate.py --input_folder {output_folder} --n_persons 1', apate_flag))
-    if not os.path.exists(ecos_flag):
-        tasks.append(("ecos", f'python3 ecos.py --input_folder {output_folder} --n_persons 1', ecos_flag))
+    for name in ("apate", "ecos"):
+        flag = os.path.join(output_folder, f"{name}_done.txt")
+        if not os.path.exists(flag):
+            cmd = f'python3 {name}.py --input_folder {output_folder} --n_persons 1'
+            tasks.append((name, cmd, flag))
 
     if not tasks:
-        print("No se necesitan ejecutar apate.py ni ecos.py (ambos flags presentes).")
+        print("ecos.py y apate.py ya están marcados como completados.")
         return
-    
-    # Ejecutamos todas las tareas que faltan (1 o 2) en paralelo.
-    print("Ejecutando scripts faltantes en modo recuperación...")
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_task = {}
-        for (name, cmd, flag_path) in tasks:
-            future = executor.submit(run_command, cmd)
-            future_to_task[future] = (name, flag_path)
 
-        for future in concurrent.futures.as_completed(future_to_task):
-            name, flag_path = future_to_task[future]
-            retcode = future.result()  # Código de salida devuelto por os.system
-            if retcode == 0:
-                # Éxito
-                print(f"{name}.py se ejecutó correctamente. Marcando como completado.")
-                with open(flag_path, "w") as f:
+    print("Ejecutando análisis de voz faltantes...")
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        futures = {ex.submit(run_command, cmd): (name, flag) for name, cmd, flag in tasks}
+        for fut in concurrent.futures.as_completed(futures):
+            name, flag = futures[fut]
+            if fut.result() == 0:
+                print(f"{name}.py terminó correctamente.")
+                with open(flag, "w") as f:
                     f.write("done")
             else:
-                print(f"⚠️  {name}.py terminó con un error (código {retcode}). No se marcará como completado.")
+                print(f"⚠️  {name}.py falló (no se crea flag).")
 
-def run_recovery(output_folder, offset, check_hands):
+def build_duckdb_if_needed(output_folder: str) -> None:
     """
-    Modo recuperación: Reanuda el proceso en los pasos faltantes,
-    basándose en la existencia de JSON, parquet y archivos bandera.
+    Genera dataset.duckdb si aún no existe, previa confirmación interactiva.
     """
-    dataset_dir = os.path.join(output_folder, "dataset")
-    
-    # Paso 1: Si existen JSON pero no los parquet, ejecuta Rscript para cada video.
-    if check_json_generated(output_folder) and not check_parquet_generated(output_folder):
-        print("JSON encontrados pero no se han generado los parquet. Ejecutando Rscript max_people_classification.R...")
-        openpose_dir = os.path.join(dataset_dir, "OpenPose")
-        for video_name in os.listdir(openpose_dir):
-            video_path = os.path.join(openpose_dir, video_name)
-            json_folder = os.path.join(video_path, "JSON_FILES")
-            if os.path.exists(json_folder):
-                print(f"Ejecutando max_people_classification.R en {json_folder}")
-                os.system(f'Rscript max_people_classification.R "{json_folder}" "{dataset_dir}" > /dev/null 2>&1')
-    else:
-        print("No es necesario ejecutar Rscript (JSON o parquet ya existentes).")
-    
-    # Paso 2: Si existen los parquet, revisar si falta apate.py o ecos.py
-    if check_parquet_generated(output_folder):
-        run_missing_scripts(output_folder)
-    else:
-        print("Aún no hay archivos parquet, no podemos ejecutar apate/ecos.")
-    
-    # Paso 3: Si no se ha generado el archivo duckdb, preguntar al usuario si lo quiere generar.
-    duckdb_file = os.path.join(output_folder, "dataset.duckdb")
-    if not os.path.exists(duckdb_file):
-        user_input = input("Todos los outputs están presentes. ¿Deseas generar el archivo duckdb? (s/n): ")
-        if user_input.lower() == "s":
-            print("Generando duckdb...")
-            os.system(f'python3 hefesto.py --input_folder {output_folder} --n_persons 1 --db_name "{duckdb_file}"')
-        else:
-            print("Generación de duckdb cancelada por el usuario.")
-    else:
-        print("El archivo duckdb ya existe.")
-
-def main():
-    parser = argparse.ArgumentParser(description="Ejecuta todas las herramientas para crear un dataset multimodal.")
-    parser.add_argument('--input', help='Archivo csv generado por tabulate', required=True)
-    parser.add_argument('--output_folder', help='Carpeta de salida para guardar el dataset', required=True)
-    parser.add_argument('--searchterm', help='Término de búsqueda para descargar los videos', required=True)
-    parser.add_argument('--offset', help='Offset para descargar los videos', required=True, type=int, default=2)
-    parser.add_argument('--check_hands', help='Comprobar manos en los videos', required=False, type=bool, default=False)
-    parser.add_argument('--resume', help='Modo recuperación: reanuda el proceso con outputs ya existentes', action='store_true')
-    
-    args = parser.parse_args()
-    searchterm = args.searchterm
-    offset = args.offset
-
-    if not os.path.exists(args.input):
-        print("El archivo de entrada no existe.")
+    db_path = os.path.join(output_folder, "dataset.duckdb")
+    if os.path.exists(db_path):
+        print("dataset.duckdb ya existe.")
         return
-    
-    if not os.path.exists(args.output_folder):
-        os.makedirs(args.output_folder)
-    
-    # Si se activa el modo recuperación, se chequean los pasos ya completados y se ejecutan los que faltan.
+    ans = input("¿Deseas generar dataset.duckdb ahora? (s/n): ").strip().lower()
+    if ans == "s":
+        run_command(
+            f'python3 hefesto.py --input_folder "{output_folder}" --n_persons 1 '
+            f'--db_name "{db_path}"'
+        )
+
+# ---------- rutinas de recuperación ------------------------------------------
+
+def run_recovery(output_folder: str) -> None:
+    """Ruta de recuperación (`--resume`)."""
+    run_argos_if_needed(output_folder)
+    generate_parquet_if_needed(output_folder)
+    if check_parquet_generated(output_folder):
+        run_missing_voice_scripts(output_folder)
+    else:
+        print("Sin parquet: ecos/apate no pueden ejecutarse todavía.")
+    build_duckdb_if_needed(output_folder)
+
+# ---------- flujo principal ---------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Pipeline de creación de datasets multimodales."
+    )
+    p.add_argument("--input", required=True, help="CSV generado por tabulate")
+    p.add_argument("--output_folder", required=True, help="Carpeta de salida")
+    p.add_argument("--searchterm", required=True, help="Término de búsqueda")
+    p.add_argument("--offset", type=int, default=2, help="Offset en segundos")
+    p.add_argument("--check_hands", action="store_true", help="Comprobar manos")
+    p.add_argument("--resume", action="store_true", help="Reanudar proceso")
+    p.add_argument(
+        "--start_at_argos",
+        action="store_true",
+        help="Arrancar directamente en el paso Argos/OpenPose",
+    )
+    p.add_argument(
+        "--skip_download",
+        action="store_true",
+        help="Suponer que los vídeos ya están en videos/raw",
+    )
+    args = p.parse_args()
+
+    out_dir = args.output_folder
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---------- modo recuperación --------------------------------------------
     if args.resume:
-        print("Modo recuperación activado.")
-        run_recovery(args.output_folder, offset, args.check_hands)
-        return  # Salir tras la recuperación
-    
-    # Si no se activa el modo recuperación, se ejecuta el proceso completo desde el inicio:
-    print("Descargando clips...")
-    os.system(
-        f'python3 download_clips.py '
-        f'--csv_file {args.input} '
-        f'--searchterm {searchterm} '
-        f'--output_dir {args.output_folder}/videos/raw '
-        f'--offset {offset}'
-    )
-   
-    abs_ASD_input_dir = os.path.abspath(f"{args.output_folder}/videos/raw")
-    abs_ASD_output_dir = os.path.abspath(f"{args.output_folder}/videos/masked")
+        print("==> Modo recuperación (--resume)")
+        run_recovery(out_dir)
+        return
 
-    print(f"ASD_input_dir: {abs_ASD_input_dir}")
-    print(f"ASD_output_dir: {abs_ASD_output_dir}")
-    
-    print("Procesando videos con TalkNet-ASD...")
-    current_path = os.getcwd()
-    os.system(
-        f'cd {ASD_PATH} && '
-        f'./process_video.py --input_dir "{abs_ASD_input_dir}" '
-        f'--output_dir "{abs_ASD_output_dir}" '
-        f'--second {offset}'
-    )
-    os.chdir(current_path)
+    # ---------- modo arranque en Argos ---------------------------------------
+    if args.start_at_argos:
+        print("==> Arranque directo en Argos (--start_at_argos)")
+        run_argos_if_needed(out_dir)
+        generate_parquet_if_needed(out_dir)
+        run_missing_voice_scripts(out_dir)
 
-    print("Descartando clips con más de una persona...")
-    os.system(
-        f'python3 is_there_a_person_in_the_video.py '
-        f'--videos_folder {args.output_folder}/videos/masked '
-        f'--discarded_videos {args.output_folder}/videos/discarded '
-        f'--matched_videos {args.output_folder}/videos/1_person '
+        # Construcción de DuckDB con nombre basado en searchterm
+        db_filename = f"{sanitize_filename(args.searchterm)}.duckdb"
+        duckdb_path = os.path.join(out_dir, db_filename)
+        if not os.path.exists(duckdb_path):
+            print(f"Generando {db_filename} directamente (modo --start_at_argos)…")
+            run_command(
+                f'python3 hefesto.py --input_folder "{out_dir}" '
+                f'--n_persons 1 --db_name "{duckdb_path}"'
+            )
+        else:
+            print(f"{db_filename} ya existe.")
+
+        return
+
+    # ---------- flujo completo desde cero ------------------------------------
+    if not args.skip_download:
+        print("Descargando clips...")
+        run_command(
+            f'python3 download_clips.py --csv_file "{args.input}" '
+            f'--searchterm "{args.searchterm}" '
+            f'--output_dir "{out_dir}/videos/raw" --offset {args.offset}'
+        )
+    else:
+        print("🔹 Skip download: se asume videos/raw listo.")
+
+    # Procesamiento ASD
+    in_raw = os.path.abspath(f"{out_dir}/videos/raw")
+    out_masked = os.path.abspath(f"{out_dir}/videos/masked")
+    print("Procesando con TalkNet‑ASD…")
+    run_command(
+        f'cd "{ASD_PATH}" && ./process_video.py '
+        f'--input_dir "{in_raw}" --output_dir "{out_masked}" '
+        f'--second {args.offset}'
+    )
+
+    # Filtrado a un hablante
+    run_command(
+        "python3 is_there_a_person_in_the_video.py "
+        f'--videos_folder "{out_masked}" '
+        f'--discarded_videos "{out_dir}/videos/discarded" '
+        f'--matched_videos "{out_dir}/videos/1_person" '
         f'--check_hands {args.check_hands}'
     )
-   
-    print("Ejecutando OpenPose y dfMaker... (esto puede tardar un poco)")
-    os.system(
-        f'python3 argos.py '
-        f'--videos_folder {args.output_folder}/videos/1_person '
-        f'--output_folder {args.output_folder} '
-        f'--openpose_path /opt/openpose '
-        f'--face_hands True '
-        f'--skeletons True'
-    )
-    
-    print("Ejecutando análisis de voz (ecos.py y apate.py) en paralelo (modo completo)...")
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_ecos = executor.submit(run_command, f'python3 ecos.py --input_folder {args.output_folder} --n_persons 1')
-        future_apate = executor.submit(run_command, f'python3 apate.py --input_folder {args.output_folder} --n_persons 1')
-        concurrent.futures.wait([future_ecos, future_apate])
 
-    # Si ambos terminaron con exit code 0, marcamos como done.
-    # (Aquí asumimos que, en la mayoría de casos, terminan bien. 
-    #  Si uno falló, tu "modo no-recovery" no marca, y podrás retomar con --resume).
-    if (future_ecos.result() == 0) and (future_apate.result() == 0):
-        mark_apate_ecos_done(args.output_folder)
-        print("Ambos scripts de análisis de voz completados con éxito.")
+    # Argos y sucesivos
+    run_argos_if_needed(out_dir)
+    generate_parquet_if_needed(out_dir)
+
+    # Análisis de voz en paralelo
+    print("Ejecutando análisis de voz (ecos/apate)…")
+    with concurrent.futures.ThreadPoolExecutor() as ex:
+        fut_ecos = ex.submit(
+            run_command, f'python3 ecos.py --input_folder "{out_dir}" --n_persons 1'
+        )
+        fut_apate = ex.submit(
+            run_command, f'python3 apate.py --input_folder "{out_dir}" --n_persons 1'
+        )
+        concurrent.futures.wait([fut_ecos, fut_apate])
+
+    if fut_ecos.result() == 0 and fut_apate.result() == 0:
+        mark_apate_ecos_done(out_dir)
+        print("ecos.py y apate.py completados correctamente.")
     else:
-        print("⚠️  Al menos uno de los scripts (ecos/apate) falló. Usa --resume para reintentarlo.")
+        print("⚠️  ecos/apate fallaron. Reintenta con --resume.")
 
-    print("Combinando todos los datos y generando el dataset...")
-    os.system(
-        f'python3 hefesto.py '
-        f'--input_folder {args.output_folder} '
-        f'--n_persons 1 '
-        f'--db_name {args.output_folder}/dataset.duckdb'
+    # Construcción del DuckDB
+    run_command(
+        f'python3 hefesto.py --input_folder "{out_dir}" '
+        f'--n_persons 1 --db_name "{out_dir}/dataset.duckdb"'
     )
 
-    # Mover los videos buenos a una carpeta
-    os.makedirs(os.path.join(args.output_folder, 'videos', 'good'), exist_ok=True)
-    parquet_folder = os.path.join(args.output_folder, 'dataset', '1_persons', 'parquet_files')
-    if os.path.exists(parquet_folder):
-        for parquet_file in os.listdir(parquet_folder):
-            if parquet_file.endswith('.parquet'):
-                video_name = parquet_file.replace('.parquet', '.mp4')
-                src_video_path = os.path.join(args.output_folder, "videos", "raw", video_name)
-                dest_video_path = os.path.join(args.output_folder, "videos", "good", video_name)
-                if os.path.exists(src_video_path):
-                    os.system(f'cp "{src_video_path}" "{dest_video_path}"')
+    # Copia de vídeos “buenos”
+    good_dir = os.path.join(out_dir, "videos", "good")
+    os.makedirs(good_dir, exist_ok=True)
+    parquet_dir = os.path.join(out_dir, "dataset", "1_persons", "parquet_files")
+    if os.path.exists(parquet_dir):
+        for pq in os.listdir(parquet_dir):
+            if pq.endswith(".parquet"):
+                mp4 = pq.replace(".parquet", ".mp4")
+                src = os.path.join(out_dir, "videos", "raw", mp4)
+                if os.path.exists(src):
+                    run_command(f'cp "{src}" "{good_dir}/{mp4}"')
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
