@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo/POLYMNIA_logo.png" alt="POLYMNIA logo" width="50%">
+  <img src="assets/logo/polymnia_logo.png" alt="POLYMNIA logo" width="50%">
 </p>
 
 <p align="center">
