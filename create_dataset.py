@@ -277,7 +277,7 @@ def main() -> None:
                 mp4 = pq.replace(".parquet", ".mp4")
                 src = os.path.join(out_dir, "videos", "raw", mp4)
                 if os.path.exists(src):
-                    run_command(f'cp "{src}" "{good_dir}/{mp4}"')
+                    run_command(f'mv "{src}" "{good_dir}/{mp4}"')
 
 if __name__ == "__main__":
     main()
