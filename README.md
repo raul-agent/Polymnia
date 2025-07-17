@@ -1,7 +1,24 @@
-# Multimodal Dataset Creation Pipeline
+<p align="center">
+  <img src="assets/logo/polymia_logo.png" alt="POLYMIA logo" width="50%">
+</p>
 
-This repository contains a modular pipeline for creating multimodal datasets from video clips. It includes automatic downloading, filtering, pose extraction, prosodic analysis, lexical alignment, and integration into structured formats like Parquet and DuckDB.
+<p align="center">
+  <strong style="font-size: 2em;">POLYMIA</strong><br>
+  <span style="font-size: 1.2em;">Modular pipeline for multimodal language analysis</span>
+</p>
 
+<p align="center">
+  <a href="https://doi.org/10.5281/zenodo.XXXXXXXX"><img src="https://zenodo.org/badge/DOI_REPO_ID.svg" alt="DOI"></a>
+  <img src="https://github.com/daedalusLAB/polymia/actions/workflows/main.yml/badge.svg" alt="Test POLYMIA pipeline">
+</p>
+
+> **Check** [CHANGELOG.md](./CHANGELOG.md) **for recent updates.**
+
+---
+
+## 🧬 Overview
+
+**POLYMIA** is a modular pipeline for the automated processing of multimodal linguistic data. It integrates modules for body pose estimation (OpenPose), prosodic analysis (Parole), gesture normalization (dfMaker), and alignment of text and audio (WhisperX), combining them into a unified data structure optimized for research and visualization.
 
 
 ## 🔧 Installation
