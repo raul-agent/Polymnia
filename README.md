@@ -246,5 +246,12 @@ Developed by **DaedalusLAB**
 For multimodal linguistic research, gesture-prosody alignment, and AI-enhanced corpus construction.
 
 
+## 🧩 Theoretical Framework
 
+**POLYMNIA** is based on the principle that language is a *physical phenomenon* observable in space and time.
+Every linguistic act —acoustic, gestural, or digital— involves energy, duration, and spatial organization.
+Therefore, language can be modeled as a **dynamic system**, where its components interact non-linearly and evolve together over time.
+
+The pipeline measures and models these physical traces —movement, prosody, and lexical timing— to infer reproducible knowledge (*episteme*) about the **multimodal flow of language** understood as a real, measurable process.
+This approach shifts the focus from isolated linguistic units to the continuous interaction among modalities, aligning linguistic research with the empirical standards of the natural sciences.
 
