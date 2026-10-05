@@ -159,6 +159,36 @@ que se pisaba entre ejecuciones concurrentes.
    (extrae datetime, país, cadena, programa, hora…). Revísalo si tus nombres de
    fichero no siguen el patrón UCLA NewsScape: desactiva las claves que no apliquen.
 
+## Muestreo de prosodia: por qué `hefesto.py` ya no hace `iloc[::6]`
+
+`prepare_prosody_data` reducía la prosodia **posicionalmente** (`iloc[::6]`), es
+decir «una fila de cada seis». Eso solo equivale a «un muestreo por frame de
+vídeo» si el productor emite exactamente 6 filas por frame y además llegan ordenadas.
+Con el pipeline actual no se cumple: `process_prosody.R` interpola (spline) pitch,
+intensity y harmonicity **sobre los timestamps de frame** antes de escribir, o sea
+1 fila por frame (verificado: 485 filas para 485 frames consecutivos). El `::6`
+sobre eso era un **doble recorte**: tiraba 5/6 de mediciones válidas y dejaba `pitch`
+en solo el **16,5 %** de las filas unidas.
+
+Ahora se selecciona **por el valor de `frame`** (`drop_duplicates` + `sort`), que es
+identidad cuando los datos ya vienen a 1 fila/frame y sigue dando una fila por frame
+si volviera un productor denso. Ateado en `tools/test_prosody_align.py` (3 casos:
+1 fila/frame, denso 6/frame, denso barajado — los dos ultimos fallaban con `::6`).
+
+Medido sobre los 10 clips reales de `1_persons`, mismo join y mismas filas:
+
+| | filas | filas con `pitch` | tamano |
+|---|---|---|---|
+| con `iloc[::6]` | 819.397 | 135.767 (16,6 %) | 24,5 MB |
+| seleccionando por `frame` | 819.397 | 818.027 (99,8 %) | 24,8 MB |
+
+**Lee la columna con cuidado: 99,8 % de filas *con valor* no es 99,8 % de medición
+real.** El spline de parole rellena el silencio, así que el **45,8 %** de los `pitch`
+lleva un valor interpolado cerca de cero (`pitch < 20`), y solo el **53,9 %** es una
+medición plausible. **Filtra por `vad` antes de entrenar nada fonético**: con
+`vad = false` el pitch medio sale 7,8 Hz (no es fonación). Eso es comportamiento de
+parole, anterior a este cambio, y no se toca aquí.
+
 ## El divisor de 1000/100 es correcto: no lo "arregles"
 
 `download_clips.py` lee los campos 4º/5º según el **nombre** del fichero (columna 1):
