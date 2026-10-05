@@ -21,8 +21,12 @@ import re
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.environ["PYTHON_SCRIPT_DIR"] = script_dir  # for the R scripts
 
-# Adjust this path to your TalkNet‑ASD installation
-ASD_PATH = "/home/user/TalkNet-ASD"
+# Path to your TalkNet‑ASD installation. It is a separate checkout next to this
+# repo, so read it from the environment instead of a hard-coded path.
+ASD_PATH = os.environ.get(
+    "POLYMNIA_ASD_PATH",
+    os.path.join(os.path.dirname(script_dir), "TalkNet-ASD"),
+)
 
 # ---------- common utilities --------------------------------------------------
 
