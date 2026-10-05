@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# polymnia — CLI único para el pipeline POLYMNIA.
+#
+# Envuelve cada etapa del pipeline y pone las variables de entorno que los
+# scripts del repo esperan (PYTHON_SCRIPT_DIR, R_LIBS_USER, PATH de praat,
+# PATH de whisperx) para no tener que recordar nada.
+#
+# Uso:
+#   polymnia <comando> [opciones...]
+#   polymnia help
+#
+# Todo se ejecuta con `uv run` contra .venv del repo: no hay que activar nada.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)"
+PAROLE_DIR="${REPO_ROOT}/create_datasets/parole"
+OPENPOSE_BIN_DEFAULT="${OPENPOSE_PATH:-/opt/openpose}"
+# TalkNet-ASD es un checkout aparte (fork de RaulKite). Ver SETUP.md.
+ASD_PATH_DEFAULT="${POLYMNIA_ASD_PATH:-$(cd "${REPO_ROOT}/.." && pwd -P)/TalkNet-ASD}"
+
+# ---------------------------------------------------------------- environment
+setup_env() {
+  # R: multimolang/logger/arrow viven en R_libs del repo
+  export R_LIBS_USER="${REPO_ROOT}/R_libs"
+  # R: max_people_classification.R localiza R_libs vía esta variable
+  export PYTHON_SCRIPT_DIR="${REPO_ROOT}"
+  # Praat barren portable instalado junto a parole
+  if [ -x "${PAROLE_DIR}/env/praat/praat" ]; then
+    export PATH="${PAROLE_DIR}/env/praat:$PATH"
+  fi
+  # whisperx y el resto de consolas del venv
+  export PATH="${REPO_ROOT}/.venv/bin:$PATH"
+}
+
+uvrun() { (cd "${REPO_ROOT}" && exec uv run --no-sync "$@"); }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { echo "❌ Falta '$1' en PATH" >&2; exit 1; }
+}
+
+usage() {
+  cat <<'EOF'
+polymnia — pipeline multimodal (CLI)
+
+Ejecuta etapas dentro del entorno uv del repo. No hay que activar venvs.
+
+  polymnia doctor                         # qué hay instalado y qué falta
+  polymnia asd       --input_dir D --output_dir D [--second N]   # TalkNet-ASD (raw -> masked)
+  polymnia download  --txt_file F --searchterm T [--output_dir D] [--offset N]
+                                     [--no-check]         # saltar la criba del tabulado
+  polymnia check-tab F [--offset N] [--show N]  # validar tabulado sin descargar
+  polymnia filter    --videos_folder D --matched_videos D --discarded_videos D [--check_hands True]
+  polymnia argos     --videos_folder D --output_folder D [--openpose_path P] [--face_hands True] [--skeletons True]
+  polymnia parquet   --json_folder D --dataset_dir D      # solo max_people_classification.R
+  polymnia ecos      --input_folder D --n_persons 1       # prosodia (parole: Silero+Praat+R)
+  polymnia apate     --input_folder D --n_persons 1       # WhisperX + palabras por frame
+  polymnia merge     --input_folder D --n_persons 1 --db_name F.duckdb
+                                     [--no-compat]        # saltar el adaptador de prosodia
+  polymnia voice     --input_folder D --n_persons 1       # ecos + apate en paralelo
+  polymnia whisperx  <args...>            # whisperx directo (GPU por defecto)
+  polymnia rscript   <script.R> [args...] # Rscript con R_libs del repo
+  polymnia duckdb    <ruta.duckdb> [-c "SELECT ..."]   # consola duckdb (CLI local)
+  polymnia python    <args...>            # python del venv
+
+Flujo completo desde un .txt tabulado:
+  polymnia download --txt_file clips.txt --searchterm climate --output_dir out/videos/raw
+  polymnia filter   --videos_folder out/videos/raw --matched_videos out/videos/1_person \
+                    --discarded_videos out/videos/discarded
+  polymnia argos    --videos_folder out/videos/1_person --output_folder out
+  polymnia voice    --input_folder out --n_persons 1
+  polymnia merge    --input_folder out --n_persons 1 --db_name out/climate.flockdb
+
+Notas:
+  * `filter` vuelca 15 JPG de depuración por vídeo en <scratch>/images (por defecto
+    .polymnia-run/, o POLYMNIA_SCRATCH=<dir>). Se puede borrar cuando quieras.
+  * `merge` ejecuta antes tools/polymnia_prosody_compat.py: `ecos.py`/parole escribe
+    la prosodia en subcarpetas con columna `frame_id` y `hefesto.py` la busca plana
+    con columna `Frame`. Usa --no-compat para desactivarlo.
+  * El paso TalkNet-ASD de create_dataset.py NO está instalado (falta el repo
+    y /home/user/TalkNet-ASD); por eso `filter` apunta a videos/raw.
+  * WhisperX necesita la GPU; `whisperx --help` para modelos/idiomas.
+EOF
+}
+
+cmd="${1:-help}"; shift || true
+setup_env
+
+case "$cmd" in
+  help|-h|--help) usage ;;
+
+  doctor)
+    echo "🐍 python/uv"
+    uvrun python -c 'import sys,torch;print("   ",sys.version.split()[0],"| torch",torch.__version__,"| CUDA",torch.cuda.is_available(), "|", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "sin GPU")'
+    for m in cv2 ultralytics parselmouth pandas duckdb pyarrow whisperx; do
+      uvrun python -c "import importlib,sys;m=importlib.import_module('$m');print('    ✅ %-14s'%('$m'), getattr(m,'__version__','ok'))" 2>/dev/null \
+        || echo "    ❌ $m NO"
+    done
+    echo "🖐  OpenPose"
+    if [ -x "${OPENPOSE_BIN_DEFAULT}/build/examples/openpose/openpose.bin" ]; then
+      echo "    ✅ ${OPENPOSE_BIN_DEFAULT}/build/examples/openpose/openpose.bin"
+    else
+      echo "    ❌ openpose.bin no encontrado en ${OPENPOSE_BIN_DEFAULT}"
+    fi
+    echo "🎯 TalkNet-ASD"
+    if [ -x "${ASD_PATH_DEFAULT}/process_video.py" ]; then
+      echo "    ✅ ${ASD_PATH_DEFAULT}"
+      for w in model/faceDetector/s3fd/sfd_face.pth pretrain_TalkSet.model; do
+        [ -f "${ASD_PATH_DEFAULT}/${w}" ] \
+          && echo "       ✅ ${w}" || echo "       ❌ falta ${w} (se descargaría con gdown)"
+      done
+    else
+      echo "    ❌ no encontrado en ${ASD_PATH_DEFAULT} (usa POLYMNIA_ASD_PATH)"
+    fi
+    echo "🗣  WhisperX CLI"
+    command -v whisperx >/dev/null && echo "    ✅ $(command -v whisperx)" || echo "    ❌ whisperx"
+    echo "🗄  DuckDB CLI"
+    if [ -x "${REPO_ROOT}/tools/bin/duckdb" ]; then
+      echo "    ✅ $(${REPO_ROOT}/tools/bin/duckdb --version) (${REPO_ROOT}/tools/bin/duckdb)"
+    else
+      echo "    ⚠️  sin CLI local (usa solo la API Python del venv)"
+    fi
+    echo "🎼 Praat"
+    if command -v praat >/dev/null; then echo "    ✅ $(praat --version 2>&1 | head -1)"; else echo "    ❌ praat no en PATH"; fi
+    echo "📊 R"
+    Rscript -e 'cat("    ", as.character(getRversion()), "\n"); for (p in c("multimolang","arrow","logger")) cat("   ", if (requireNamespace(p, quietly=TRUE)) "✅" else "❌", p, "\n")'
+    echo "🎬 ffmpeg/curl"
+    command -v ffmpeg >/dev/null && echo "    ✅ ffmpeg" || echo "    ❌ ffmpeg"
+    command -v curl   >/dev/null && echo "    ✅ curl"   || echo "    ❌ curl"
+    echo "🧩 parole (prosodia)"
+    [ -x "${PAROLE_DIR}/scripts/parole.sh" ] && echo "    ✅ ${PAROLE_DIR}/scripts/parole.sh" || echo "    ❌ parole.sh"
+    ;;
+
+  check-tab) uvrun python tools/check_tab.py "$@" ;;
+
+  asd)
+    # TalkNet-ASD: videos/raw -> videos/masked (deja solo al hablante activo)
+    [ -x "${ASD_PATH_DEFAULT}/process_video.py" ] || \
+      { echo "❌ TalkNet-ASD no encontrado en ${ASD_PATH_DEFAULT} (usa POLYMNIA_ASD_PATH)" >&2; exit 1; }
+    export ASD_VISUALISATION="${ASD_VISUALISATION:-0}" ASD_DEVICE="${ASD_DEVICE:-cuda}"
+    ( cd "${ASD_PATH_DEFAULT}" && exec "${REPO_ROOT}/.venv/bin/python" process_video.py "$@" ) ;;
+
+  download)
+    # criba previa del tabulado: divisor ms/centésimas y rango contra el nombre
+    # --no-check puede aparecer en cualquier posicion: se quita de la lista
+    check=1; dargs=()
+    for a in "$@"; do
+      if [ "$a" = "--no-check" ]; then check=0; else dargs+=("$a"); fi
+    done
+    set -- ${dargs+"${dargs[@]}"}
+    if [ $check -eq 1 ]; then
+      # acepta ambas sintaxis: --txt_file RUTA y --txt_file=RUTA (igual que argparse)
+      tab=""; off=2
+      prev=""
+      for a in "$@"; do
+        case "$a" in
+          --txt_file=*) tab="${a#*=}" ;;
+          --offset=*)   off="${a#*=}" ;;
+          *)
+            case "$prev" in
+              --txt_file) tab="$a" ;;
+              --offset)   off="$a" ;;
+            esac
+            ;;
+        esac
+        prev="$a"
+      done
+      if [ -n "$tab" ] && [ -f "$tab" ]; then
+        uvrun python tools/check_tab.py "$tab" --offset "$off" || \
+          echo "⚠️  hay líneas dudosas arriba (no corto la descarga; usa --no-check para saltar la comprobación)"
+        echo
+      fi
+    fi
+    # -u: sin buffer, para que el progreso se vea en vivo al redirigir a un log
+    require curl; uvrun python -u download_clips.py "$@" ;;
+  filter)
+    # is_there_a_person_in_the_video.py guarda 15 JPG de depuración en "images/"
+    # relativo al cwd: se ejecuta desde un directorio de trabajo aparte para no
+    # ensuciar la raíz del repo ni llenarla de imágenes.
+    scratch="${POLYMNIA_SCRATCH:-${REPO_ROOT}/.polymnia-run}"
+    mkdir -p "${scratch}/images"
+    ( cd "${scratch}" && exec uv run --no-sync --project "${REPO_ROOT}" python \
+        "${REPO_ROOT}/is_there_a_person_in_the_video.py" "$@" ) ;;
+  # -u: progreso visible en vivo al redirigir a un log (argos recorre muchos videos)
+  argos)    uvrun python -u argos.py "$@" ;;
+  ecos)     [ -x "${PAROLE_DIR}/scripts/parole.sh" ] || { echo "❌ falta create_datasets/parole" >&2; exit 1; }
+            uvrun python ecos.py "$@" ;;
+  apate)    require ffmpeg; uvrun python apate.py "$@" ;;
+  merge)
+    # hefesto espera prosodia plana; parole la escribe en subcarpetas -> adapter previo
+    compat=1
+    if [ "${1:-}" = "--no-compat" ]; then compat=0; shift; fi
+    if [ $compat -eq 1 ]; then
+      in_f=""; n_p=1
+      prev=""
+      for a in "$@"; do
+        case "$prev" in
+          --input_folder|-i) in_f="$a" ;;
+          --n_persons|-n) n_p="$a" ;;
+        esac
+        prev="$a"
+      done
+      if [ -n "$in_f" ]; then
+        uvrun python tools/polymnia_prosody_compat.py --input_folder "$in_f" --n_persons "$n_p" || true
+      fi
+    fi
+    uvrun python -u hefesto.py "$@" ;;
+  whisperx) uvrun whisperx --device cuda --compute_type float16 "$@" ;;
+  rscript)  Rscript "$@" ;;
+  duckdb)   "${REPO_ROOT}/tools/bin/duckdb" "$@" ;;
+  python)   uvrun python "$@" ;;
+
+  parquet)
+    # Etapa R suelta: --json_folder <JSON_FILES> --dataset_dir <dataset/>
+    json_folder=""; dataset_dir=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json_folder) json_folder="$2"; shift 2 ;;
+        --dataset_dir) dataset_dir="$2"; shift 2 ;;
+        *) echo "opción desconocida: $1" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$json_folder" ] && [ -n "$dataset_dir" ] || { usage; exit 1; }
+    cd "${REPO_ROOT}" && Rscript max_people_classification.R "$json_folder" "$dataset_dir"
+    ;;
+
+  voice)
+    # ecos + apate en paralelo (como hace create_dataset.py)
+    input_folder=""; n_persons=1
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --input_folder) input_folder="$2"; shift 2 ;;
+        --n_persons)    n_persons="$2"; shift 2 ;;
+        *) echo "opción desconocida: $1" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$input_folder" ] || { usage; exit 1; }
+    uvrun python ecos.py  --input_folder "$input_folder" --n_persons "$n_persons" > "${input_folder}/ecos.log"  2>&1 &
+    pe=$!
+    uvrun python apate.py --input_folder "$input_folder" --n_persons "$n_persons" > "${input_folder}/apate.log" 2>&1 &
+    pa=$!
+    rc=0
+    wait $pe || { echo "⚠️  ecos falló — ver ${input_folder}/ecos.log"; rc=1; }
+    wait $pa || { echo "⚠️  apate falló — ver ${input_folder}/apate.log"; rc=1; }
+    [ $rc -eq 0 ] && echo "✅ voz completada (ecos + apate)"
+    exit $rc
+    ;;
+
+  *) echo "❌ comando desconocido: $cmd"; echo; usage; exit 1 ;;
+esac
