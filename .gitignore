@@ -10,6 +10,11 @@ images/
 *.duckdb
 failed_downloads.log
 
+# El .env lleva la API key del VLM (theia). Nunca al repo: usa .env.example
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]

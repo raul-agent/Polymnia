@@ -57,6 +57,9 @@ Ejecuta etapas dentro del entorno uv del repo. No hay que activar venvs.
   polymnia merge     --input_folder D --n_persons 1 --db_name F.duckdb
                                      [--no-compat]        # saltar el adaptador de prosodia
   polymnia test                           # tests de las partes que se pueden probar sin GPU
+  polymnia theia   --input_folder D --n_persons 1 --db_name F.duckdb
+                                     [--csv F] [--attempts N] [--workers N] [--limit N]
+                                     [--no-db]            # anotacion visual (ultima etapa)
   polymnia voice     --input_folder D --n_persons 1       # ecos + apate en paralelo
   polymnia whisperx  <args...>            # whisperx directo (GPU por defecto)
   polymnia rscript   <script.R> [args...] # Rscript con R_libs del repo
@@ -206,6 +209,29 @@ case "$cmd" in
     fi
     uvrun python -u hefesto.py "$@" ;;
   whisperx) uvrun whisperx --device cuda --compute_type float16 "$@" ;;
+  theia)
+    input_folder=""; n_persons=""; db_name=""; csv_f=""; attempts="3"; workers="4"; limit=""; extra=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --input_folder) input_folder="$2"; shift 2 ;;
+        --n_persons)    n_persons="$2"; shift 2 ;;
+        --db_name)      db_name="$2"; shift 2 ;;
+        --csv)          csv_f="$2"; shift 2 ;;
+        --attempts)     attempts="$2"; shift 2 ;;
+        --workers)      workers="$2"; shift 2 ;;
+        --limit)        limit="$2"; shift 2 ;;
+        --no-db)        extra="--no-db"; shift ;;
+        *) echo "❌ opcion desconocida: $1"; exit 1 ;;
+      esac
+    done
+    [ -n "$input_folder" ] && [ -n "$n_persons" ] || { usage; exit 1; }
+    # el .env de la raiz (THEIA_API_BASE/THEIA_MODEL/THEIA_API_KEY) lo carga theia.py
+    args=(--input_folder "$input_folder" --n_persons "$n_persons"
+          --attempts "$attempts" --workers "$workers")
+    [ -n "$db_name" ] && args+=(--db_name "$db_name")
+    [ -n "$csv_f" ] && args+=(--csv "$csv_f")
+    [ -n "$limit" ] && args+=(--limit "$limit")
+    uvrun python "${REPO_ROOT}/theia.py" "${args[@]}" $extra ;;
   rscript)  Rscript "$@" ;;
   test)     rc=0
             for t in "${REPO_ROOT}"/tools/test_*.py; do

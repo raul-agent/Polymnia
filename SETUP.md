@@ -189,6 +189,40 @@ medición plausible. **Filtra por `vad` antes de entrenar nada fonético**: con
 `vad = false` el pitch medio sale 7,8 Hz (no es fonación). Eso es comportamiento de
 parole, anterior a este cambio, y no se toca aquí.
 
+## La última etapa: anotación visual con VLM (`theia`)
+
+Después de `merge`, `theia.py` anota cada vídeo que llegó al final preguntando a
+un LLM con visión compatible con la API de OpenAI (vLLM). Dos llamadas por vídeo,
+cada una con las imágenes que le sirven: la **escena** ve los 5 frames del vídeo
+raw (`indoor_outdoor`, `show_type`); el **hablante** ve los 5 del masked + los 5
+del raw como contexto (`hands_free`, `sitting_standing`, `screen_interaction`,
+`sex`, `age`). Los 5 frames son primero, último y 3 intermedios proporcionales.
+
+La respuesta se valida contra un esquema estricto (enums exactos, edad entera
+0-120, booleanos reales, ni claves de más ni de menos); si no cumple, se reintenta
+(`--attempts`, defecto 3) **diciéndole al modelo por qué falló la anterior**. Sin
+validación no entra nada: el criterio de aceptación es sintaxis, no calidad.
+
+Salidas: CSV `dataset/{n}_persons/video_annotations.csv` (una fila por id con
+`status` ok|error; sirve de resume: los ok se saltan al relanzar) y DuckDB:
+`multi_data` gana las 7 columnas (consultables junto a todo lo demás) y se crea
+la tabla `video_annotations` (una fila por vídeo).
+
+```
+cp .env.example .env    # y rellenar THEIA_API_BASE / THEIA_MODEL / THEIA_API_KEY
+./bin/polymnia theia --input_folder D --n_persons 1 --db_name D/dataset.duckdb
+```
+
+El `.env` está excluido de git (verificado con `git check-ignore`); la plantilla
+subible es `.env.example`. `--api-base/--api-key/--model` pisan al entorno si
+prefieres no usar fichero.
+
+Ateado en `tools/test_theia.py`: validador (coerciones, nullish, 7 rechazos),
+muestreo de frames, limpieza de respuestas con cercas/texto alrededor, y un e2e
+contra un servidor OpenAI-compatible falso que primero responde basura para
+probar el reintento, y después comprueba CSV, columnas en `multi_data`, tabla,
+y que el resume no vuelve a llamar. `polymnia test`.
+
 ## El divisor de 1000/100 es correcto: no lo "arregles"
 
 `download_clips.py` lee los campos 4º/5º según el **nombre** del fichero (columna 1):
