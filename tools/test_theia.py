@@ -255,6 +255,47 @@ def test_end_to_end_with_fake_server():
             fake.stop()
 
 
+def test_no_db_leaves_database_untouched():
+    """--no-db debe dar CSV sin tocar el DuckDB (ni columnas ni filas)."""
+    import duckdb
+
+    scene = {"indoor_outdoor": "outdoor", "show_type": "monologue", "hands_free": None,
+             "sitting_standing": None, "screen_interaction": None, "sex": None, "age": None}
+    speaker = {"indoor_outdoor": None, "show_type": None, "hands_free": False,
+               "sitting_standing": "standing", "screen_interaction": True,
+               "sex": "male", "age": 30}
+    with tempfile.TemporaryDirectory() as td:
+        root = theia.Path(td)
+        (root / "videos" / "raw").mkdir(parents=True)
+        make_video(root / "videos" / "raw" / "clipC.mp4")
+        db = root / "c.duckdb"
+        con = duckdb.connect(str(db))
+        con.execute("CREATE TABLE multi_data (id VARCHAR, frame BIGINT)")
+        con.execute("INSERT INTO multi_data VALUES ('clipC', 0)")
+        cols_before = [r[0] for r in con.execute("DESCRIBE multi_data").fetchall()]
+        tables_before = sorted(r[0] for r in con.execute("SHOW TABLES").fetchall())
+        con.close()
+
+        fake = FakeVLM([scene, speaker])
+        try:
+            n_ok, _ = theia.annotate_dataset(
+                input_folder=root, n_persons=1, db_name=db, api_base=fake.base_url,
+                api_key="t", model="m", attempts=2, workers=1,
+                csv_path=root / "c.csv", write_db=False)
+        finally:
+            fake.stop()
+        con = duckdb.connect(str(db))
+        cols_after = [r[0] for r in con.execute("DESCRIBE multi_data").fetchall()]
+        tables_after = sorted(r[0] for r in con.execute("SHOW TABLES").fetchall())
+        con.close()
+        check("no-db: anota igualmente (1 ok)", n_ok == 1, str(n_ok))
+        check("no-db: CSV escrito", (root / "c.csv").is_file())
+        check("no-db: multi_data sin columnas nuevas", cols_after == cols_before,
+              f"antes={cols_before} despues={cols_after}")
+        check("no-db: ni una tabla nueva", tables_after == tables_before,
+              f"antes={tables_before} despues={tables_after}")
+
+
 def test_exhausted_retries_record_error():
     import csv as csvmod
 

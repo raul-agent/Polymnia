@@ -379,8 +379,12 @@ def sync_to_db(db_path: Path, rows: list[dict]) -> None:
 
 
 def annotate_dataset(input_folder, n_persons, db_name, api_base, api_key, model,
-                     attempts=3, workers=4, csv_path=None, limit=None):
-    """Anota todos los ids de multi_data. Devuelve (ok, error)."""
+                     attempts=3, workers=4, csv_path=None, limit=None, write_db=True):
+    """Anota todos los ids de multi_data. Devuelve (ok, error).
+
+    write_db=False deja la base intacta: solo se lee para saber que ids anotar y
+    el resultado queda en el CSV.
+    """
     input_folder = Path(input_folder)
     n_dir = f"{n_persons}_persons"
     db_path = Path(db_name)
@@ -434,7 +438,7 @@ def annotate_dataset(input_folder, n_persons, db_name, api_base, api_key, model,
 
     lock_rows.sort(key=lambda r: r["id"])
     _write_csv(csv_path, lock_rows)
-    if db_path.is_file():
+    if write_db:
         sync_to_db(db_path, lock_rows)
     n_err = sum(1 for r in lock_rows if r["status"] == "error")
     print(f"[theia] ok={sum(1 for r in lock_rows if r['status'] == 'ok')} error={n_err} "
@@ -478,9 +482,7 @@ def main() -> int:
     _, n_err = annotate_dataset(
         args.input_folder, args.n_persons, db_name, args.api_base, args.api_key,
         args.model, attempts=args.attempts, workers=args.workers,
-        csv_path=args.csv, limit=args.limit)
-    if not args.no_db:
-        pass  # sync_to_db ya se ejecuto dentro de annotate_dataset
+        csv_path=args.csv, limit=args.limit, write_db=not args.no_db)
     return 1 if n_err else 0
 
 
