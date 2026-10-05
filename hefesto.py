@@ -23,8 +23,15 @@ def prepare_prosody_data(prosody_path: str) -> pd.DataFrame:
         print(f"[ERROR] Reading prosody file {prosody_path}: {e}")
         return pd.DataFrame()
     
-    prosody_reduced_df = prosody_df.iloc[::6].rename(columns={"Frame": "frame"})
+    # One prosody row per video frame. Positional sampling (`iloc[::6]`, the
+    # previous behaviour) assumes the producer emits exactly 6 rows per frame in
+    # frame order; parole already interpolates onto the frame timestamps (1 row per
+    # frame), so that slice silently dropped 5/6 of valid measurements. Selecting by
+    # frame value is correct for either density and for any row order.
+    prosody_reduced_df = prosody_df.rename(columns={"Frame": "frame"})
     prosody_reduced_df['frame'] = prosody_reduced_df['frame'].astype(int)
+    prosody_reduced_df = prosody_reduced_df.drop_duplicates(subset='frame', keep='first')
+    prosody_reduced_df = prosody_reduced_df.sort_values('frame')
     
     # Convert datetime to UTC, then remove timezone information
     if 'datetime' in prosody_reduced_df.columns:
