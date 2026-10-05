@@ -36,6 +36,7 @@ def download_clip_with_retries(line, searchterm, output_dir, offset, max_retries
         cmd = [
             "timeout", "20",
             "curl",
+            "--fail",
             "--connect-timeout", "5",
             "--max-time", "15",
             "-L",
@@ -48,12 +49,18 @@ def download_clip_with_retries(line, searchterm, output_dir, offset, max_retries
         while attempt <= max_retries:
             print(f"[INFO] Descargando {filename} (intento {attempt}/{max_retries})")
             result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode == 0:
+            # Sin --fail, un 500 de newsscape_mp4_snippet.cgi devuelve HTML con exit 0
+            # y se guardaria un .mp4 que no es video: los reintentos no se activarian.
+            # Con --fail curl puede no llegar a crear el fichero, de ahí el exists().
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 print(f"[OK] Descargado: {filename}")
                 return True
             else:
                 print(f"[WARNING] Fallo en {filename} (intento {attempt})")
                 logging.warning(f"Fallo en {filename} (intento {attempt}). Código: {result.returncode}")
+                # no dejar un .mp4 vacio o con el error HTML para los reintentos
+                if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+                    os.remove(output_path)
                 attempt += 1
                 time.sleep(5)  # Pausa entre reintentos
 
