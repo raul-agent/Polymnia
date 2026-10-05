@@ -130,9 +130,12 @@ class FakeVLM:
                 body = json.loads(self.rfile.read(length))
                 outer.requests.append((self.path, body))
                 reply = outer.replies.pop(0) if outer.replies else "{}"
-                payload = json.dumps(
-                    {"choices": [{"message": {"content": reply if isinstance(reply, str)
-                                              else json.dumps(reply)}}]}).encode()
+                if isinstance(reply, dict) and "_raw" in reply:
+                    payload = json.dumps(reply["_raw"]).encode()
+                else:
+                    payload = json.dumps(
+                        {"choices": [{"message": {"content": reply if isinstance(reply, str)
+                                                  else json.dumps(reply)}}]}).encode()
                 self.send_response(200)
                 self.headers_sent = True
                 self.send_header("Content-Type", "application/json")
@@ -322,6 +325,55 @@ def test_exhausted_retries_record_error():
             check("agotado: fila con status=error y valores vacios",
                   len(rows) == 1 and rows[0]["status"] == "error"
                   and rows[0]["indoor_outdoor"] == "", json.dumps(rows))
+        finally:
+            fake.stop()
+
+
+def test_reasoning_model_truncated_is_reported():
+    """Un modelo de razonamiento puede agotar max_tokens en reasoning y dejar
+    content vacio: el error debe decirlo (finish_reason), no 'no hay JSON'."""
+    import csv as csvmod
+    length_stop = {"_raw": {"choices": [{"message": {"role": "assistant", "content": None},
+                                         "finish_reason": "length"}]}}
+    with tempfile.TemporaryDirectory() as td:
+        root = theia.Path(td)
+        (root / "videos" / "raw").mkdir(parents=True)
+        make_video(root / "videos" / "raw" / "clipD.mp4")
+        db = root / "d4.duckdb"
+        import duckdb
+        con = duckdb.connect(str(db))
+        con.execute("CREATE TABLE multi_data (id VARCHAR, frame BIGINT)")
+        con.execute("INSERT INTO multi_data VALUES ('clipD', 0)")
+        con.close()
+        fake = FakeVLM([length_stop] * 6)
+        try:
+            csv_path = root / "d4.csv"
+            n_ok, n_err = theia.annotate_dataset(
+                input_folder=root, n_persons=1, db_name=db, api_base=fake.base_url,
+                api_key="t", model="m", attempts=3, workers=1, csv_path=csv_path)
+            row = next(iter(csvmod.DictReader(open(csv_path))))
+            check("truncado: termina en error", (n_ok, n_err) == (0, 1), str((n_ok, n_err)))
+            check("truncado: el error menciona finish_reason/tokens",
+                  "finish_reason=length" in row["error"], row["error"][:160])
+            # y con presupuesto mayor debe pasar (el servidor responde bien tras el truncamiento)
+            scene = {"indoor_outdoor": "outdoor", "show_type": "interview",
+                     "hands_free": None, "sitting_standing": None,
+                     "screen_interaction": None, "sex": None, "age": None}
+            speaker = {"indoor_outdoor": None, "show_type": None, "hands_free": False,
+                       "sitting_standing": "standing", "screen_interaction": False,
+                       "sex": "male", "age": 50}
+            fake2 = FakeVLM([length_stop, scene, speaker])
+            try:
+                n2, _ = theia.annotate_dataset(
+                    input_folder=root, n_persons=1, db_name=db, api_base=fake2.base_url,
+                    api_key="t", model="m", attempts=3, workers=1,
+                    csv_path=root / "d5.csv", max_tokens=2000)
+                check("truncado: el retry dentro del intento recupera", n2 == 1, str(n2))
+                check("truncado: max_tokens viaja en la peticion",
+                      fake2.requests[0][1].get("max_tokens") == 2000,
+                      str(fake2.requests[0][1].get("max_tokens")))
+            finally:
+                fake2.stop()
         finally:
             fake.stop()
 

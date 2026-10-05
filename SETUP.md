@@ -200,13 +200,18 @@ del raw como contexto (`hands_free`, `sitting_standing`, `screen_interaction`,
 
 La respuesta se valida contra un esquema estricto (enums exactos, edad entera
 0-120, booleanos reales, ni claves de más ni de menos); si no cumple, se reintenta
-(`--attempts`, defecto 3) **diciéndole al modelo por qué falló la anterior**. Sin
+`--attempts`, defecto 3) **diciéndole al modelo por qué falló la anterior**. Si el
+fallo fue `finish_reason=length` (el modelo de razonamiento se quedó sin
+presupuesto), el siguiente intento **duplica `--max-tokens`** en vez de repetir la
+misma llamada. Sin
 validación no entra nada: el criterio de aceptación es sintaxis, no calidad.
 
 Salidas: CSV `dataset/{n}_persons/video_annotations.csv` (una fila por id con
-`status` ok|error; sirve de resume: los ok se saltan al relanzar) y DuckDB:
-`multi_data` gana las 7 columnas (consultables junto a todo lo demás) y se crea
-la tabla `video_annotations` (una fila por vídeo).
+`status` ok|error; **el CSV es el registro completo**: los ids con `status=error`
+conservan las anotaciones parciales válidas de la parte que sí salió — p.ej. la
+escena — y solo les falta la que falló; los ok se saltan al relanzar) y DuckDB:
+`multi_data` gana las 7 columnas (consultables junto a todo lo demas) y se crea
+la tabla `video_annotations` (una fila por video, solo de los ok).
 
 ```
 cp .env.example .env    # y rellenar THEIA_API_BASE / THEIA_MODEL / THEIA_API_KEY

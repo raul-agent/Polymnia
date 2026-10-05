@@ -61,6 +61,10 @@ NULLISH = {"", "null", "none", "n/a", "na", "unknown", "uncertain",
 TRUEISH = {"true", "yes", "si", "1"}
 FALSEISH = {"false", "no", "0"}
 AGE_RANGE = (0, 120)
+# A reasoning model burns most of this on hidden chain-of-thought before the
+# JSON: measured on a real vLLM endpoint, the speaker call (10 images) used 470
+# reasoning tokens and needed ~540 in total. 400 truncated it to content=null.
+DEFAULT_MAX_TOKENS = 2000
 MAX_SIDE = 768  # frames reducidos a este lado maximo antes de mandar
 
 
@@ -226,13 +230,14 @@ SPEAKER_PROMPT = (
 
 
 def ask_vlm(session: requests.Session, api_base: str, api_key: str, model: str,
-            images: list[dict], prompt: str, timeout: int = 180) -> str:
+            images: list[dict], prompt: str, timeout: int = 600,
+            max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
     resp = session.post(
         f"{api_base.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
         json={
             "model": model,
-            "max_tokens": 400,
+            "max_tokens": max_tokens,
             "temperature": 0,
             "messages": [{"role": "user", "content": images + [
                 {"type": "text", "text": prompt}]}],
@@ -240,7 +245,20 @@ def ask_vlm(session: requests.Session, api_base: str, api_key: str, model: str,
         timeout=timeout,
     )
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    choice = resp.json()["choices"][0]
+    content = choice["message"].get("content")
+    if not content:
+        # A reasoning model that spends the whole budget on `reasoning_content`
+        # returns content=null with finish_reason=length. Saying "no JSON in the
+        # response" sends you hunting for a formatting bug; the real cause is the
+        # token budget, so name it.
+        reason = choice.get("finish_reason")
+        if reason == "length":
+            raise AnnotationError(
+                f"respuesta truncada (finish_reason=length) con max_tokens={max_tokens}: "
+                "el modelo agoto el presupuesto antes de escribir el JSON; sube --max-tokens")
+        raise AnnotationError(f"respuesta vacia (finish_reason={reason!r})")
+    return content
 
 
 def parse_json_response(text: str) -> dict:
@@ -270,7 +288,8 @@ def parse_json_response(text: str) -> dict:
 
 def annotate_video(video_id: str, raw_video: Path, masked_video: Path | None,
                    api_base: str, api_key: str, model: str, attempts: int,
-                   session: requests.Session | None = None) -> dict:
+                   session: requests.Session | None = None,
+                   max_tokens: int = DEFAULT_MAX_TOKENS) -> dict:
     """Devuelve dict de 7 claves combinando escena (raw) y hablante (masked+raw).
 
     Lanza AnnotationError si una de las dos partes agota los intentos.
@@ -294,10 +313,12 @@ def annotate_video(video_id: str, raw_video: Path, masked_video: Path | None,
             images += data_url(extract_frames(src, indices))
         last_err = "sin intentos"
         feedback = ""
+        budget = max_tokens
         for _ in range(attempts):
             try:
                 text = ask_vlm(session, api_base, api_key, model, images,
-                               prompt + feedback)
+                               prompt + feedback, max_tokens=budget)
+                part = validate_annotation(parse_json_response(text))
                 part = validate_annotation(parse_json_response(text))
                 # cada parte trae nulls en los campos de la otra: solo se rellenan
                 # valores, nunca se pisan con nulls ajenos
@@ -307,6 +328,9 @@ def annotate_video(video_id: str, raw_video: Path, masked_video: Path | None,
                 break
             except (AnnotationError, requests.RequestException) as e:
                 last_err = str(e)
+                if "finish_reason=length" in last_err:
+                    # same prompt with the same budget would truncate the same way
+                    budget *= 2
                 feedback = (f"\n\nTu respuesta anterior fue INVALIDA ({last_err[:300]}). "
                             "Corrigela y responde otra vez solo con el JSON.")
         else:
@@ -379,7 +403,8 @@ def sync_to_db(db_path: Path, rows: list[dict]) -> None:
 
 
 def annotate_dataset(input_folder, n_persons, db_name, api_base, api_key, model,
-                     attempts=3, workers=4, csv_path=None, limit=None, write_db=True):
+                     attempts=3, workers=4, csv_path=None, limit=None, write_db=True,
+                     max_tokens=DEFAULT_MAX_TOKENS):
     """Anota todos los ids de multi_data. Devuelve (ok, error).
 
     write_db=False deja la base intacta: solo se lee para saber que ids anotar y
@@ -415,7 +440,7 @@ def annotate_dataset(input_folder, n_persons, db_name, api_base, api_key, model,
         if not raw_video.is_file():
             raise AnnotationError(f"no existe {raw_video}")
         return annotate_video(video_id, raw_video, masked_dir / f"{video_id}.mp4",
-                              api_base, api_key, model, attempts)
+                              api_base, api_key, model, attempts, max_tokens=max_tokens)
 
     print(f"[theia] anotando {len(todo)} videos ({len(done)} ya hechos), "
           f"model={model} @ {api_base}")
@@ -466,6 +491,10 @@ def main() -> int:
                         help="reintentos de respuesta invalida por parte (defecto 3)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                        help=f"presupuesto por llamada (defecto {DEFAULT_MAX_TOKENS}); "
+                             "los modelos de razonamiento lo gastan en su cadena "
+                             "oculta y se quedan sin espacio para el JSON")
     parser.add_argument("--no-db", action="store_true", help="solo CSV, no tocar DuckDB")
     args = parser.parse_args()
 
@@ -482,7 +511,8 @@ def main() -> int:
     _, n_err = annotate_dataset(
         args.input_folder, args.n_persons, db_name, args.api_base, args.api_key,
         args.model, attempts=args.attempts, workers=args.workers,
-        csv_path=args.csv, limit=args.limit, write_db=not args.no_db)
+        csv_path=args.csv, limit=args.limit, write_db=not args.no_db,
+        max_tokens=args.max_tokens)
     return 1 if n_err else 0
 
 
