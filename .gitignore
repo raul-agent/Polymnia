@@ -1,0 +1,22 @@
+# Entorno creado para este montaje (no forma parte del pipeline original)
+.venv/
+.uv/
+.polymnia-run/
+R_libs/
+
+# Pesos de modelos, volcados de depuración y logs de etapa
+weights/
+images/
+*.duckdb
+failed_downloads.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Clone externo de parole (repo propio con su .git)
+create_datasets/
+
+# binario de terceros descargado, no es codigo del proyecto
+# (ver SETUP.md: se descarga con la orden indicada)
+tools/bin/
