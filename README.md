@@ -129,6 +129,42 @@ Outputs include `videos/{raw,masked,1_person,discarded}/`, OpenPose JSONs in
 `parquet_files/`, `parquet_speech_analysis/`, `whisperx/` and
 `whisperx_framer_output/`. The example keeps a separate DuckDB file per category.
 
+## Optional body-visibility filter
+
+`argos` can drop clips whose joints of interest are barely visible, before the
+dfMaker step. It is off by default; add `--filter-body-visibility` to turn it on.
+Point it at the **masked** videos, like a normal `argos` run.
+
+```bash
+./bin/polymnia argos --videos_folder "$OUT/videos/1_person" --output_folder "$OUT" \
+  --filter-body-visibility --required-body-points 4,7 --min-visible-percent 40
+```
+
+Each requested BODY_25 index (default `4,7`, both wrists) must be visible with
+confidence at least `--min-keypoint-confidence` (default `0.2`) in at least
+`--min-visible-percent` (default `40`) of **all** frames of the source video, as
+reported by the video metadata. The percentage is computed per point and the
+windows do not have to coincide: a clip showing one wrist in the first half and
+the other in the second half passes at 40%. Frames with no person, frames with
+missing OpenPose JSON and joints with score `0` count as absent. A frame with
+more than one person rejects the clip.
+
+Each clip gets a report in `dataset/body_visibility/{clip}.json`. Completed
+measurements include per-point counts, the denominator and configuration; errors
+include their cause. Evaluator errors mark statistics as partial, with NULL presence
+counts when the frame inventory cannot be validated. Rejected clips keep their video and
+OpenPose JSON and never reach dfMaker; a `.parquet` left by an earlier run is
+moved to `dataset/body_visibility/rejected/{reason}/parquet_files/` so downstream
+stages cannot pick it up. Unusable measurements (failed OpenPose, malformed JSON,
+non-finite coordinates, non-BODY_25 skeleton, unexpected frame indices) are
+reported as `data_error` and make the run exit non-zero instead of guessing;
+ordinary rejections exit `0`. On a gated rerun, the JSON of the previous run is
+preserved in `dataset/OpenPose/{clip}/previous_json/` and never deleted, so
+coverage is always measured on the frames produced by that invocation.
+
+Wrist detections are a proxy, not proof that the entire hand is visible. Use a fresh
+DuckDB file for a filtered rebuild: this gate does not remove previously merged rows.
+
 ## Optional visual annotations
 
 After merging, export `THEIA_API_BASE`, `THEIA_MODEL` and `THEIA_API_KEY` into the
