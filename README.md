@@ -2,256 +2,214 @@
   <img src="assets/logo/polymnia_logo.png" alt="POLYMNIA logo" width="50%">
 </p>
 
-<p align="center">
-  <strong style="font-size: 2em;">POLYMNIA</strong><br>
-  <span style="font-size: 1.2em;">Modular pipeline for multimodal language analysis</span>
-</p>
+# POLYMNIA
 
-<p align="center">
-  <a href="https://doi.org/10.5281/zenodo.XXXXXXXX"><img src="https://zenodo.org/badge/DOI_REPO_ID.svg" alt="DOI"></a>
-  <img src="https://github.com/daedalusLAB/POLYMNIA/actions/workflows/main.yml/badge.svg" alt="Test POLYMNIA pipeline">
-</p>
+**A modular pipeline for multimodal language research.** POLYMNIA combines body,
+face and hand keypoints, person-relative coordinates, prosodic features and
+frame-aligned words in a queryable DuckDB dataset. An optional vision-language
+model (VLM) stage adds seven video-level annotations.
 
-> **Check** [CHANGELOG.md](./CHANGELOG.md) **for recent updates.**
+Start with the workflow below. For installation details and compatibility notes,
+see [SETUP.md](SETUP.md) (Spanish, with commands and local deployment examples).
+Use the repository's commit history to track changes.
 
----
+## Pipeline at a glance
 
-## 🧬 Overview
+```text
+NewsScape tab file → download → TalkNet-ASD → person filter → OpenPose / dfMaker
+                                                         ↓
+raw audio ──────────────────────────────────────→ Parole + WhisperX
+                                                         ↓
+                                                    DuckDB merge
+                                                         ↓
+                                              optional VLM annotations
+```
 
-**POLYMNIA** is a modular pipeline for the automated processing of multimodal linguistic data. It integrates modules for body pose estimation (OpenPose), prosodic analysis (Parole), gesture normalization (dfMaker), and alignment of text and audio (WhisperX), combining them into a unified data structure optimized for research and visualization.
+| Stage | CLI command | Purpose |
+|---|---|---|
+| Validate / download | `check-tab`, `download` | Check timing fields; retrieve NewsScape clips |
+| Identify the speaker | `asd` | Produce speaker-masked videos with TalkNet-ASD |
+| Filter clips | `filter` | Select clips meeting the single-visible-person criteria |
+| Extract movement | `argos` | Run OpenPose, transform coordinates with dfMaker, classify by person count |
+| Extract speech | `voice` | Run Parole (`ecos`) and WhisperX (`apate`) in parallel |
+| Assemble the dataset | `merge` | Align pose, prosody and words by frame in DuckDB |
+| Annotate videos | `theia` | Query a vision model for scene and speaker attributes |
 
+The filter and OpenPose are different detectors: a clip accepted by `filter` can
+still be classified into a multiple-person category by `argos`.
 
-## 🔧 Installation
+## Installation
 
-Create a virtual environment and install dependencies:
+The current environment targets **Linux with an NVIDIA GPU**. Python dependencies
+are managed with [uv](https://docs.astral.sh/uv/); the project selects Python 3.12
+and PyTorch 2.8-compatible CUDA 12.8 builds on non-macOS x86_64/AMD64.
+Other platforms are not established as supported end-to-end configurations.
+
+From the repository root:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-````
-
-> `parole.sh` (used for prosody analysis) is part of the [parole system](https://github.com/daedalusLAB/parole), which includes its own installer (`install_parole.sh`) for Praat, R scripts, and dependencies. See `parole/` and install it before running `ecos.py`.
-
-## 📦 Requirements
-
-See `requirements.txt`:
-
-```txt
-argparse
-opencv-python
-ultralytics
-praat-parselmouth
-moviepy
-pandas
-duckdb
-pyarrow
-git+https://github.com/m-bain/whisperx.git
+uv sync --frozen --extra asd
+./bin/polymnia help
+./bin/polymnia doctor
 ```
 
-External dependencies:
+`uv sync` installs Python dependencies, **not the external tools or model weights**:
 
-* `curl` and `ffmpeg` (for video/audio processing)
-* R + packages (`arrow`, `logger`, `multimolang`)
-* OpenPose (compiled binary)
-* Praat (called by `parole.sh`)
+| Dependency | Required setup |
+|---|---|
+| OpenPose | Compiled binary; default root `/opt/openpose`, or `--openpose_path` for `argos` |
+| TalkNet-ASD | Separate [RaulKite checkout](https://github.com/RaulKite/TalkNet-ASD) and its face-detector / TalkSet weights; default `../TalkNet-ASD`, override with `POLYMNIA_ASD_PATH`. See its [compatibility fixes](https://github.com/RaulKite/TalkNet-ASD/pull/1). |
+| R | `multimolang`, `arrow`, `logger`; local packages in `R_libs/`, configuration in `config_dfMaker.json` |
+| Parole / Praat | [Parole](https://github.com/daedalusLAB/parole) under `create_datasets/parole/`, with its dependencies and Praat configured |
+| System tools | Bash, `curl`, GNU `timeout`, `ffmpeg`, `ffprobe` and `Rscript` |
+| DuckDB CLI | Executable at `tools/bin/duckdb` for `polymnia duckdb`; Python DuckDB is installed by uv |
+| Vision endpoint | Optional OpenAI-compatible chat-completions API with image support |
 
+The wrapper sets the Python and R paths and uses the existing uv environment;
+no manual virtual-environment activation is needed. Run `doctor` before processing.
 
+## Input format
 
-## 1️⃣ `download_clips.py` — Download video clips from NewsScape
+The downloader reads a **headerless, tab-separated file** with at least six fields:
 
-Downloads `.mp4` video clips from `gallo.case.edu` based on a tabulated `.txt` file. Adds a configurable offset to clip timestamps. Retries failed downloads and logs errors.
+| Position | Meaning |
+|---|---|
+| 1 | NewsScape filename/path; basename becomes part of the output clip ID |
+| 2 | NewsScape clip/program identifier used by the download service |
+| 3 / 4 | Start time: whole seconds / fractional integer |
+| 5 / 6 | End time: whole seconds / fractional integer |
 
-**Inputs**:
+Extra fields are ignored by the downloader. The fractional divisor is **1000 when
+the normalized filename starts with `2017`, otherwise 100**. This is the literal
+current rule, not a general guarantee for later years. The standalone downloader's
+padding default is 2.5 seconds on each side; the workflow below specifies it explicitly.
 
-* `--txt_file`: Tab-separated file with clip metadata
-* `--searchterm`: Label for clip naming
-* `--offset`: Seconds before/after clip (default: 2.5)
-* `--output_dir`: Target folder for videos
+Run `check-tab` first: it checks parsing, reversed intervals and agreement with
+ranges embedded in filenames. The download wrapper also checks, but warnings do
+not abort downloads. `verify_videos.py` checks the resulting media independently.
 
-**Example**:
+## Run the workflow
+
+Run from the repository root with **absolute paths**. Paths and clip filenames
+must also be free of whitespace and shell metacharacters: downstream scripts build
+unquoted shell commands. Use trusted inputs; replace the path and search label below.
 
 ```bash
-python3 download_clips.py \
-  --txt_file clips.txt \
-  --searchterm climate_change \
-  --output_dir ./output/videos/raw
+set -euo pipefail
+TAB="/absolute/path/clips.txt"
+OUT="$PWD/output"
+mkdir -p "$OUT"
+./bin/polymnia check-tab "$TAB" --offset 2.5
+./bin/polymnia download --txt_file "$TAB" --searchterm climate \
+  --offset 2.5 --output_dir "$OUT/videos/raw"
+./bin/polymnia python tools/verify_videos.py "$OUT/videos/raw"
+./bin/polymnia asd --input_dir "$OUT/videos/raw" --output_dir "$OUT/videos/masked"
+./bin/polymnia filter --videos_folder "$OUT/videos/masked" \
+  --matched_videos "$OUT/videos/1_person" --discarded_videos "$OUT/videos/discarded"
+./bin/polymnia argos --videos_folder "$OUT/videos/1_person" --output_folder "$OUT"
+
+# Process every category actually produced, not a fixed list of person counts.
+for category in "$OUT"/dataset/*_persons; do
+  [ -d "$category/parquet_files" ] || continue
+  n="${category##*/}"; n="${n%_persons}"
+  [[ "$n" =~ ^[0-9]+$ ]] || continue
+  ./bin/polymnia voice --input_folder "$OUT" --n_persons "$n"
+  ./bin/polymnia merge --input_folder "$OUT" --n_persons "$n" \
+    --db_name "$OUT/multi_${n}p.duckdb"
+done
 ```
 
+Pose extraction uses the **filtered masked videos** in this example; speech stages
+use their matching **raw videos**. `voice` writes `ecos.log` and `apate.log` at the
+output root, overwriting those logs for each category. Check outputs as well as
+exit codes: earlier stages can discard clips or skip missing files.
 
+Outputs include `videos/{raw,masked,1_person,discarded}/`, OpenPose JSONs in
+`dataset/OpenPose/{id}/JSON_FILES/`, and `dataset/{n}_persons/` containing
+`parquet_files/`, `parquet_speech_analysis/`, `whisperx/` and
+`whisperx_framer_output/`. The example keeps a separate DuckDB file per category.
 
-## 2️⃣ `is_there_a_person_in_the_video.py` — Filter usable clips
+## Optional visual annotations
 
-Uses YOLOv8-Pose to accept only videos with exactly **one visible person** (head, shoulders, and optionally hands). Extracts 15 representative frames per clip.
-
-**Inputs**:
-
-* `--videos_folder`: Folder with `.mp4` files
-* `--matched_videos`: Output folder for accepted clips
-* `--discarded_videos`: Folder to store discarded clips
-* `--check_hands`: Require hand keypoints (default: False)
-
-**Example**:
+After merging, export `THEIA_API_BASE`, `THEIA_MODEL` and `THEIA_API_KEY` into the
+process environment. Do not put credentials in Git, shared commands or datasets.
+A repository `.env` is ignored by Git, but this version's API-key fallback does
+not reliably load a key supplied **only** there; use exported variables.
 
 ```bash
-python3 is_there_a_person_in_the_video.py \
-  --videos_folder ./output/videos/masked \
-  --matched_videos ./output/videos/1_person \
-  --discarded_videos ./output/videos/discarded \
-  --check_hands True
+./bin/polymnia theia --input_folder "$OUT" --n_persons 1 \
+  --db_name "$OUT/multi_1p.duckdb"
 ```
 
+Theia selects IDs from `multi_data`, samples up to five proportional frame
+positions, and makes separate scene (raw) and speaker (masked + raw context)
+requests. It validates responses and retries failures; **schema validity is not
+annotation accuracy**. Unknown values may be NULL.
 
+| Field | Accepted values (also NULL) |
+|---|---|
+| `indoor_outdoor` | `indoor`, `outdoor` |
+| `show_type` | `news anchor`, `monologue`, `weather report`, `interview` |
+| `hands_free`, `screen_interaction` | Boolean |
+| `sitting_standing` | `sitting`, `standing` |
+| `sex` | `male`, `female` (model estimate, not verified identity) |
+| `age` | Integer 0–120 (model estimate) |
 
-## 3️⃣ `argos.py` — Run OpenPose and classify by number of people
+Results go to `dataset/{n}_persons/video_annotations.csv`, the `video_annotations`
+table, and seven columns in `multi_data`. Inspect `status` / `error` before use.
+`--no-db` writes CSV only. Resume skips CSV rows marked `ok` and retries errors;
+if all rows are already `ok`, it returns without synchronizing a new database.
+For endpoint/model overrides or `--max-tokens`, use
+`./bin/polymnia python theia.py --help`: these flags are not forwarded by the
+`theia` wrapper. Repeat annotation for each category you want to include.
 
-Runs OpenPose on each video and saves body keypoints in `JSON_FILES/`. Then calls an R script to standardize coordinates and classify videos into `1_persons/`, `2_persons/`, etc.
+## Querying and interpreting the data
 
-**Inputs**:
+`multi_data` is **long format**, not one row per frame: pose rows carry clip,
+frame, person and keypoint identifiers (`id`, `frame`, `people_id`, `type_points`,
+`points`). Speech values repeat across keypoint rows; annotations repeat across
+all rows of a clip. Count distinct IDs for clip totals and collapse frame-level
+features before statistical analysis. Frame indices are 1-based in the merged pose data.
 
-* `--videos_folder`: Folder with filtered `.mp4` videos
-* `--output_folder`: Root output directory
-* `--openpose_path`: Path to OpenPose build
-* `--face_hands`: Enable face/hands detection
-* `--skeletons`: Save skeleton render videos
-
-**Example**:
-
-```bash
-python3 argos.py \
-  --videos_folder ./output/videos/1_person \
-  --output_folder ./output \
-  --openpose_path /opt/openpose \
-  --face_hands True \
-  --skeletons True
+```sql
+SELECT count(*) AS rows, count(DISTINCT id) AS clips FROM multi_data;
+SELECT show_type, count(*) AS clips
+FROM video_annotations WHERE status = 'ok' GROUP BY show_type;
+WITH per_frame AS (
+  SELECT id, frame, max(pitch) AS pitch, bool_or(vad) AS vad
+  FROM multi_data GROUP BY id, frame
+)
+SELECT avg(pitch) FILTER (WHERE vad) AS mean_voiced_pitch_hz FROM per_frame;
 ```
 
+`x` / `y` are pixel coordinates; `nx` / `ny` are dfMaker person-relative
+transformed coordinates, **not [0,1] screen coordinates**. Missing keypoints or
+anchors can produce NULLs. Parole interpolates prosody onto frame timestamps:
+non-null pitch does not prove phonation. VAD is useful for selecting speech, but
+is not a guarantee that every pitch estimate is valid.
 
+## Verification and limitations
 
-## 4️⃣ `max_people_classification.R` — Coordinate normalization and person counting
+Run `./bin/polymnia test` for the CPU-focused prosody-alignment and Theia tests
+(Theia uses a local fake HTTP server, not a paid endpoint). These do not replace
+end-to-end checks of external models, downloads and generated datasets.
 
-Called automatically by `argos.py`. Uses the `multimolang::dfMaker()` function to:
+- `merge` adapts Parole's nested output into derived flat files expected by
+  Hefesto, preserving originals. Missing prosody can skip an entire clip.
+- Reruns are stage-specific: **merge appends rows**, so use a fresh database for
+  a clean rebuild. Do not assume every stage is idempotent or supports resume.
+- Speaker detection and person counting are model decisions, not ground truth.
+  Keep raw media and inspect discarded clips before interpreting coverage.
+- For new naming conventions, review `config_dfMaker.json` metadata extraction.
 
-* Normalize OpenPose JSONs into structured Parquet
-* Detect number of people per video
-* Write `num_persons.txt` and save `.parquet` to:
-  `dataset/{n_persons}_persons/parquet_files/`
+## Research context, authors and license
 
-Dependencies are installed locally in `R_libs/` if not available.
+Developed by **DaedalusLAB** for multimodal linguistic research, gesture–prosody
+alignment and corpus construction. POLYMNIA treats language as a physical,
+dynamic process: movement, acoustic features and lexical timing provide measurable
+traces of the interaction among modalities, rather than isolated linguistic units.
 
-
-
-## 5️⃣ `ecos.py` — Run prosody analysis via Parole
-
-Calls `parole.sh` for each video using the `.mp4` and corresponding `.parquet` coordinates. Generates prosodic curves (pitch, intensity, etc.) aligned to frames.
-
-**Inputs**:
-
-* `--input_folder`: Root folder with dataset
-* `--n_persons`: Number of people to select (e.g., 1)
-
-**Output**:
-
-* Parquet files stored in `parquet_speech_analysis/`
-
-**Example**:
-
-```bash
-python3 ecos.py \
-  --input_folder ./output \
-  --n_persons 1
-```
-
-
-
-## 6️⃣ `apate.py` — Run WhisperX and align words to frames
-
-* Extracts audio from `.mp4` using `ffmpeg`
-* Runs `whisperx` for transcription + word timing
-* Aligns words with video frames
-* Saves frame-level lexical info as `.json`
-
-**Output**:
-
-* `whisperx/` and `whisperx_framer_output/` directories with aligned data
-
-**Example**:
-
-```bash
-python3 apate.py \
-  --input_folder ./output \
-  --n_persons 1
-```
-
-
-
-## 7️⃣ `hefesto.py` — Merge all modalities into DuckDB
-
-Merges pose data, prosody, and lexical info into a unified DuckDB database. Performs outer joins by `frame`. Skips missing or corrupted files and logs discrepancies.
-
-**Inputs**:
-
-* Pose `.parquet`: `parquet_files/`
-* Prosody `.parquet`: `parquet_speech_analysis/`
-* Words `.json`: `whisperx_framer_output/`
-
-**Output**:
-
-* `dataset.duckdb` with a `multi_data` table
-
-**Example**:
-
-```bash
-python3 hefesto.py \
-  --input_folder ./output \
-  --n_persons 1 \
-  --db_name ./output/dataset.duckdb
-```
-
-
-
-## 📁 Output Structure
-
-```
-output/
-├── videos/
-│   ├── raw/               # Downloaded videos
-│   ├── masked/            # ASD-processed videos
-│   ├── discarded/         # Rejected videos
-│   └── 1_person/          # Accepted videos (1 visible speaker)
-├── dataset/
-│   ├── OpenPose/          # OpenPose JSONs
-│   ├── 1_persons/
-│   │   ├── parquet_files/
-│   │   ├── parquet_speech_analysis/
-│   │   ├── whisperx/
-│   │   └── whisperx_framer_output/
-│   └── dataset.duckdb     # Final database
-```
-
-
-
-## 📌 Notes
-
-* All modules are idempotent and modular — rerun safely with `--resume` or `--start_at_argos`.
-* Processing can be parallelized using `concurrent.futures` where applicable.
-* All logs and errors are saved for reproducibility.
-* This pipeline assumes a well-formed tabulated `txt` and structured `.mp4` filenames.
-
-
-
-## 👥 Authors
-
-Developed by **DaedalusLAB**
-For multimodal linguistic research, gesture-prosody alignment, and AI-enhanced corpus construction.
-
-
-## 🧩 Theoretical Framework
-
-**POLYMNIA** is based on the principle that language is a *physical phenomenon* observable in space and time.
-Every linguistic act —acoustic, gestural, or digital— involves energy, duration, and spatial organization.
-Therefore, language can be modeled as a **dynamic system**, where its components interact non-linearly and evolve together over time.
-
-The pipeline measures and models these physical traces —movement, prosody, and lexical timing— to infer reproducible knowledge (*episteme*) about the **multimodal flow of language** understood as a real, measurable process.
-This approach shifts the focus from isolated linguistic units to the continuous interaction among modalities, aligning linguistic research with the empirical standards of the natural sciences.
-
+The repository is distributed under [GNU GPL v3](LICENSE). External software,
+model weights and source media have their own terms; this license does not grant
+redistribution rights for NewsScape videos. No release DOI is currently documented
+here; cite the repository URL and the exact commit used for reproducibility.
