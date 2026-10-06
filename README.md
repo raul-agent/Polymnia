@@ -128,6 +128,47 @@ python3 argos.py \
 
 
 
+### Optional body-visibility filter
+
+Add `--filter-body-visibility` to `argos.py` to reject clips with insufficient
+BODY_25 keypoint coverage **before dfMaker**. It is disabled by default. Use the
+filtered **masked** videos, not the raw scene videos:
+
+```bash
+python3 argos.py \
+  --videos_folder /absolute/path/output/videos/1_person \
+  --output_folder /absolute/path/output \
+  --filter-body-visibility \
+  --required-body-points 4,7 \
+  --min-visible-percent 40 \
+  --min-keypoint-confidence 0.2
+```
+
+With the CLI introduced in [PR #1](https://github.com/daedalusLAB/Polymnia/pull/1),
+the same options are forwarded by `./bin/polymnia argos`.
+
+- Each selected BODY_25 point must independently reach the minimum percentage of
+  **all source-video frames** (video metadata denominator). The visibility windows
+  need not coincide. Default `4,7` means right and left wrists, not finger keypoints.
+- Confidence must be at least the configured threshold. Score `0`, missing JSON
+  frames and frames without a person count as absence. Any multi-person frame
+  rejects the clip. Wrist detection is a proxy, not proof the entire hand is visible.
+- Reports: `dataset/body_visibility/{clip}.json`, with configuration, decision and
+  available per-point measurements. Invalid JSON/data or tool failures produce
+  `data_error`, a non-zero exit, and do not stop later clips from being evaluated.
+  Partial evaluator statistics are marked; invalid inventories have null presence counts.
+- Videos and JSON are preserved. Rejected clips do not reach dfMaker; their old
+  Parquet files move to `dataset/body_visibility/rejected/{reason}/parquet_files/`.
+  Gated reruns archive previous JSON under `dataset/OpenPose/{clip}/previous_json/`.
+- Rebuild into a fresh DuckDB: the filter does not remove previously merged rows.
+
+Tests (synthetic JSON and fake external tools; no GPU/OpenPose/R needed):
+
+```bash
+python3 tools/test_body_visibility.py
+python3 tools/test_argos_visibility.py  # needs the project's OpenCV dependency
+```
+
 ## 4️⃣ `max_people_classification.R` — Coordinate normalization and person counting
 
 Called automatically by `argos.py`. Uses the `multimolang::dfMaker()` function to:
