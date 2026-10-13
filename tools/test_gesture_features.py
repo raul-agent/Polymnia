@@ -763,6 +763,190 @@ def test_final_frame_int64_overflow_is_rejected():
             check(f"int64 overflow rejected: {frame!r}", True)
 
 
+def rows2(spec, clip="clipA", people=1.0):
+    """Wide input rows with BOTH wrists: (frame, t, nx4, ny4, nx7, ny7, c)."""
+    out = []
+    for frame, t, rx, ry, lx, ly, c in spec:
+        out.append(dict(id=clip, people_id=people, frame=frame, frame_timestamp=t,
+                        nx_4=rx, ny_4=ry, c_4=c, nx_7=lx, ny_7=ly, c_7=c))
+    return out
+
+
+def both_hands(path_right, path_left, fps=30.0, c=0.9, start_frame=0, clip="clipA"):
+    """One clip from two coordinate paths, sampled on a real frame clock."""
+    n = len(path_right)
+    return wide(rows2([(start_frame + i, (start_frame + i) / fps, *path_right[i], *path_left[i], c)
+                       for i in range(n)], clip=clip))
+
+
+def circle(radius=1.0, cx=2.0, cy=0.0, laps=2.0, n=61):
+    angles = np.linspace(0.0, 2.0 * math.pi * laps, n)
+    return [(cx + radius * math.cos(a), cy + radius * math.sin(a)) for a in angles]
+
+
+def horizontal_back_and_forth(n=61, fps=30.0):
+    """x: 3 -> 1 -> 3 -> 1 (exactly two reversals), y constant."""
+    t = np.linspace(0.0, 2.0, n)
+    return [(1.0 + abs((ti * 1.5) % 2.0 - 1.0) * 2.0, 1.0) for ti in t]
+
+
+def ext(df, **cfg):
+    cfg.setdefault("window_size", 1)
+    return gf.compute_gesture_features(df, cfg, extended=True)
+
+
+def test_extended_block_keeps_v1_untouched():
+    df = both_hands(circle(), circle())
+    base_frames, base_seq = gf.compute_gesture_features(df, {"window_size": 1})
+    ext_frames, ext_seq = ext(df)
+    check("extended no toca FRAME_COLUMNS", base_frames.shape[1] + len(gf.EXTENDED_FRAME_COLUMNS)
+          == ext_frames.shape[1], f"{base_frames.shape} vs {ext_frames.shape}")
+    check("extended anade 6 columnas de fotograma", len(gf.EXTENDED_FRAME_COLUMNS) == 6,
+          str(gf.EXTENDED_FRAME_COLUMNS))
+    check("extended anade 134 columnas de secuencia", len(gf.EXTENDED_SEQUENCE_MEASURES) == 134,
+          str(len(gf.EXTENDED_SEQUENCE_MEASURES)))
+    check("schema extendido declarado", list(ext_seq.columns) == list(gf.sequence_columns(True)))
+    check("version de schema", (gf.feature_version(False), gf.feature_version(True)) == ("2", "3"))
+    same = all(np.array_equal(base_seq[c].to_numpy(float), ext_seq[c].to_numpy(float), equal_nan=True)
+               for c in gf.SEQUENCE_COLUMNS if c != "id")
+    check("valores v1 identicos", same)
+    same_frames = all(np.array_equal(base_frames[c].to_numpy(float), ext_frames[c].to_numpy(float),
+                                     equal_nan=True)
+                      for c in gf.FRAME_COLUMNS if c not in ("id", "frame_timestamp"))
+    check("valores v1 de fotograma identicos", same_frames)
+    check("sin colisiones de nombre",
+          not set(gf.EXTENDED_SEQUENCE_MEASURES) & set(gf.SEQUENCE_COLUMNS))
+
+
+def test_extended_circle_geometry_is_the_expected_area():
+    seq = ext(both_hands(circle(radius=1.0), circle(radius=1.0)))[1]
+    row = seq.iloc[0]
+    check("hull de un circulo r=1 ~ pi", abs(row.right_hull_area - math.pi) < 0.02 * math.pi,
+          f"{row.right_hull_area:.4f}")
+    check("elipse 2-sigma de un circulo r=1 ~ 2pi", abs(row.right_ellipse_area - 2 * math.pi) < 0.05 * math.pi,
+          f"{row.right_ellipse_area:.4f}")
+    check("bbox de un circulo r=1 es 2x2", abs(row.right_bbox_area - 4.0) < 0.05,
+          f"{row.right_bbox_area:.4f}")
+
+
+def test_extended_stationary_hand_reports_null_not_float_dust():
+    """np.gradient leaves ~1e-15 on a constant coordinate: that is not movement."""
+    still = [(1.0, 1.0)] * 61
+    frames, seq = ext(both_hands(still, still))
+    row, frow = seq.iloc[0], frames.iloc[30]
+    check("mano quieta: rapidez ~ polvo", frow.right_speed < 1e-9, f"{frow.right_speed:.2e}")
+    check("mano quieta: cv_speed NULL", math.isnan(row.right_cv_speed), f"{row.right_cv_speed}")
+    check("mano quieta: sin inversiones fantasma", math.isnan(row.right_reversals_x),
+          f"{row.right_reversals_x}")
+    check("mano quieta: skew/kurtosis NULL",
+          math.isnan(row.right_speed_skew) and math.isnan(row.right_speed_kurtosis))
+    check("mano quieta: longest_moving_s NULL", math.isnan(row.right_longest_moving_s))
+    check("mano quieta: fraccion por encima del umbral si es 0", row.right_frac_speed_gt_0p5 == 0.0)
+    check("mano quieta: areas 0",
+          row.right_hull_area == 0.0 and row.right_ellipse_area == 0.0 and row.right_bbox_area == 0.0)
+    check("mano quieta: std de espejo 0 (posicion constante)", row.mirror_error_x_std == 0.0)
+
+
+def test_extended_reversals_are_per_axis_and_per_second():
+    path = horizontal_back_and_forth()
+    seq = ext(both_hands(path, path))[1].iloc[0]
+    check("ida y vuelta: 2 inversiones en x", seq.right_reversals_x == 2.0, f"{seq.right_reversals_x}")
+    check("ida y vuelta: el eje y no invertido es NULL, no 0", math.isnan(seq.right_reversals_y),
+          f"{seq.right_reversals_y}")
+    check("reversals_radial usa unidades/s, no el paso", seq.right_reversals_radial == 2.0,
+          f"{seq.right_reversals_radial}")
+    check("reversals_per_s sobre duration_s", abs(seq.right_reversals_per_s - 1.0) < 1e-9,
+          f"{seq.right_reversals_per_s}")
+    check("trayectoria recta: elipse y hull 0",
+          seq.right_ellipse_area < 1e-9 and seq.right_hull_area < 1e-9)
+
+
+def test_extended_phase_sees_antiphase():
+    antiphase_left = [(2.0 + math.cos(a + math.pi), math.sin(a + math.pi))
+                      for a in np.linspace(0.0, 4.0 * math.pi, 61)]
+    anti = ext(both_hands(circle(radius=1.0), antiphase_left))[1].iloc[0]
+    check("manos en antifase: cos ~ -1", anti.cos_phase_mean < -0.9, f"{anti.cos_phase_mean:.4f}")
+    check("manos en antifase: frac_lt_m0p2 ~ 1", anti.frac_cos_lt_m0p2 > 0.9)
+    check("manos en antifase: casi ninguna en fase", anti.frac_cos_gt_0p8 < 0.05)
+    together = ext(both_hands(circle(radius=1.0), circle(radius=1.0)))[1].iloc[0]
+    check("manos identicas: cos ~ +1", together.cos_phase_mean > 0.9, f"{together.cos_phase_mean:.4f}")
+    still = [(1.0, 1.0)] * 61
+    alone = ext(both_hands(circle(radius=1.0), still))[1].iloc[0]
+    check("una mano quieta: fase NULL, no un angulo de ruido",
+          alone.n_cos_phase == 0.0 and math.isnan(alone.cos_phase_mean), f"{alone.n_cos_phase}")
+    check("una mano quieta: coactividad 0", alone.coactivity_frac_0p5 == 0.0)
+
+
+def test_extended_jerk_needs_four_timed_frames():
+    path = [(1.0 + 0.02 * i, 0.5) for i in range(3)]
+    short = ext(both_hands(path, path))[0]
+    check("jerk con 3 frames es NULL", math.isnan(short.right_jerk_magnitude.iloc[1]),
+          f"{short.right_jerk_magnitude.iloc[1]}")
+    straight = [(0.02 * i, 0.0) for i in range(31)]
+    linear = ext(both_hands(straight, straight))[0]
+    check("movimiento rectilineo uniforme: jerk ~ 0",
+          np.nanmax(np.abs(linear.right_jerk_magnitude.to_numpy(float))) < 1e-6,
+          f"{np.nanmax(np.abs(linear.right_jerk_magnitude.to_numpy(float))):.2e}")
+    accel = [(0.5 * (i / 30.0) ** 2 * 9.0, 0.0) for i in range(61)]
+    curved = ext(both_hands(accel, accel))[0]
+    check("jerk finito donde hay aceleracion variable",
+          np.isfinite(curved.right_jerk_magnitude.to_numpy(float)).sum() > 30)
+
+
+def test_extended_no_keypoint_is_null_except_counts():
+    void = [(None, None)] * 20
+    seq = ext(both_hands(void, void, c=None))[1].iloc[0]
+    counts = {"right_n_speed", "left_n_speed", "n_cos_phase", "coactivity_bout_n"}
+    not_null = {c for c in gf.EXTENDED_SEQUENCE_MEASURES if not math.isnan(float(seq[c]))}
+    check("sin keypoint: todo el bloque NULL salvo contadores", not_null == counts, str(not_null))
+    check("contadores a 0 (0 si es una medida)",
+          all(float(seq[c]) == 0.0 for c in counts))
+
+
+def test_extended_values_never_depend_on_the_clip_set():
+    circle_left = circle(radius=1.0)
+    still = [(1.0, 1.0)] * 61
+    df = pd.concat([both_hands(circle_left, circle_left).assign(id="circle"),
+                    both_hands(still, still).assign(id="still"),
+                    both_hands(horizontal_back_and_forth(), circle_left).assign(id="laps")],
+                   ignore_index=True)
+    full = ext(df)[1].set_index("id")
+    subset = ext(df[df.id != "circle"])[1].set_index("id")
+
+    def value(frame, column):
+        return float(frame.loc["laps", column])
+
+    drift = [c for c in gf.EXTENDED_SEQUENCE_MEASURES
+             if value(full, c) != value(subset, c)
+             and not (math.isnan(value(full, c)) and math.isnan(value(subset, c)))]
+    check("ninguna columna extendida depende del lote", not drift, ", ".join(drift[:4]))
+
+
+def test_extended_thin_samples_are_null_and_the_counter_says_so():
+    """Un percentil sobre 8 frames es ruido: NULL, y n_speed deja ver el denominador."""
+    moving = [(0.05 * i, 0.0) for i in range(8)]
+    row = ext(both_hands(moving, moving))[1].iloc[0]
+    check("muestras finas: el contador si registra lo medido", row.right_n_speed == 8.0,
+          f"{row.right_n_speed}")
+    check("muestras finas: distribucion NULL",
+          all(math.isnan(float(row[c])) for c in
+              ("right_speed_p50", "right_speed_min", "right_speed_std",
+               "right_neck_distance_p95", "right_nx_max", "right_hull_area",
+               "right_ellipse_area", "right_bbox_area")))
+    check("muestras finas: ratios y formas NULL",
+          all(math.isnan(float(row[c])) for c in
+              ("right_cv_speed", "right_mean_over_max", "right_speed_skew",
+               "right_frac_speed_gt_0p5", "right_speed_sq_mean", "right_longest_moving_s")))
+    check("muestras finas: contadores a 0 son una medida, no NULL",
+          row.n_cos_phase == 8.0 and row.coactivity_bout_n == 1.0, f"{row.n_cos_phase}")
+    check("muestras finas: estadisticos bimanuales NULL",
+          all(math.isnan(float(row[c])) for c in
+              ("cos_phase_mean", "cos_phase_std", "frac_cos_lt_m0p2", "coactivity_frac_0p5",
+               "coactivity_bout_mean_s", "mirror_error_x_std", "bbox_area_wrists")))
+    check("v1 sigue publicando lo que pueda (mean_speed con 8 samples)",
+          row.right_mean_speed > 0.5, f"{row.right_mean_speed}")
+
+
 if __name__ == "__main__":
     for fn in sorted(k for k in dir() if k.startswith("test_")):
         try:

@@ -74,8 +74,21 @@ BODY_25_RIGHT_WRIST = 4
 BODY_25_LEFT_WRIST = 7
 HAND_POINTS = {"right": BODY_25_RIGHT_WRIST, "left": BODY_25_LEFT_WRIST}
 
-FEATURE_VERSION = "2"          # bump when the feature meaning changes
+FEATURE_VERSION = "3"          # bump when the feature meaning changes
+BASE_FEATURE_VERSION = "2"     # schema of the default (non-extended) call
 PARAM_NAMES = ("min_keypoint_confidence", "max_gap_frames", "window_size", "poly_order")
+
+# The one absolute threshold this module uses. Chosen from the observed speed
+# distribution of the delivery corpus (median 0.38-0.39, p90 1.4-1.6 neck-space
+# units/s): 0.5 units/s sits at about the 55th percentile, so "moving" means
+# faster than the typical frame, not faster than nothing.
+MOVEMENT_SPEED = 0.5
+
+# An aggregate needs a denominator. With fewer samples than this the statistic is
+# published as NULL - the count columns (n_speed, n_cos_phase) still say what was
+# measured. In the 29-clip delivery the phase columns had clips sitting on 1, 5
+# and 6 frames, and a "mean" over one frame is noise with three decimals.
+MIN_STAT_SAMPLES = 10
 
 REQUIRED_WIDE_COLUMNS = ("id", "people_id", "frame", "frame_timestamp",
                          "nx_4", "ny_4", "c_4", "nx_7", "ny_7", "c_7")
@@ -128,6 +141,101 @@ FEATURE_UNITS = {
     "counts and fractions": "float64; fractions divide by frames_grid, every frame of the OBSERVED frame span including frames with no clock mark",
     "NULL": "not measured: absent keypoint, low confidence, or too few connected samples",
 }
+
+# ------------------------------------------------- extended block (opt-in) ----
+# Added behind a flag so a FEATURE_VERSION 2 read stays byte-identical. Nothing
+# here normalizes across clips, nothing here bins space (the observed neck
+# distance of a raised hand spans 1.9-2.8 units, so spatial bins saturate), and
+# every column is an aggregate of the frame table over finite values only.
+
+EXTENDED_FRAME_MEASURES = ("jerk_x", "jerk_y", "jerk_magnitude")
+EXTENDED_FRAME_COLUMNS = tuple(f"{hand}_{m}" for hand in ("right", "left")
+                               for m in EXTENDED_FRAME_MEASURES)
+
+_AGG_MEASURES = ("speed", "accel_magnitude", "jerk_magnitude", "neck_distance")
+_AGG_STATS = ("min", "p05", "p25", "p50", "p75", "p95", "max", "std")
+_SPEED_THRESHOLDS = (0.5, 1.0, 2.0)
+
+
+def _extended_hand_measures():
+    names = [f"{m}_{s}" for m in _AGG_MEASURES for s in _AGG_STATS]
+    names += [f"{axis}_{s}" for axis in ("nx", "ny") for s in ("min", "max", "std")]
+    names += ["reversals_x", "reversals_y", "reversals_radial", "reversals_per_s"]
+    names += ["hull_area", "ellipse_area", "bbox_area"]
+    names += ["cv_speed", "mean_over_max", "t_peak_rel", "early_late_speed_ratio",
+              "speed_skew", "speed_kurtosis"]
+    names += [f"frac_speed_gt_{str(t).replace('.', 'p')}" for t in _SPEED_THRESHOLDS]
+    names += ["speed_sq_mean", "speed_sq_sum", "n_speed", "longest_moving_s"]
+    return tuple(names)
+
+
+EXTENDED_BILATERAL_MEASURES = ("cos_phase_mean", "cos_phase_median", "cos_phase_std",
+                               "cos_phase_p05", "cos_phase_p95", "frac_cos_gt_0p8",
+                               "frac_cos_lt_m0p2", "n_cos_phase",
+                               "coactivity_frac_0p5", "coactivity_frac_1p0", "coactivity_bout_n",
+                               "coactivity_bout_mean_s", "coactivity_bout_max_s",
+                               "mirror_error_x_std", "mirror_error_y_std",
+                               "abs_y_pair_sum_mean", "pair_elevation_mean", "bbox_area_wrists")
+
+EXTENDED_HAND_MEASURES = _extended_hand_measures()
+EXTENDED_SEQUENCE_MEASURES = (tuple(f"{hand}_{m}" for hand in ("right", "left")
+                                    for m in EXTENDED_HAND_MEASURES) + EXTENDED_BILATERAL_MEASURES)
+
+EXTENDED_FEATURE_UNITS = {
+    "jerk (jerk_x, jerk_y, jerk_magnitude)": "neck-space units per second cubed; third derivative of the SMOOTHED coordinate on runs of >= 4 timed frames, NULL below that",
+    "distribution aggregates (*_min, *_p05, *_p25, *_p50, *_p75, *_p95, *_max, *_std)": "linear-interpolated percentiles and sample std (ddof=1) over finite values of that measure only; *_std is NULL for a single sample",
+    "extent (nx_min, nx_max, nx_std, ny_min, ny_max, ny_std)": "smoothed neck-space coordinates; nx_range/ny_range already published are max-min of the same series",
+    "reversals (reversals_x, reversals_y, reversals_radial)": ("count of sign changes of THAT component across adjacent timed frames, restricted to samples with |component| > MOVEMENT_SPEED: np.gradient leaves float dust of order 1e-15 on a stationary axis and counting its sign flips would invent a shake. A purely horizontal move therefore reports reversals_x and NULL reversals_y, not 0. Exact-zero samples hold the previous sign. reversals_radial is d(neck_distance)/dt of adjacent timed frames in units/s (never the raw per-step difference, which is a different unit)"),
+    "reversals_per_s": "(reversals_x + reversals_y) / duration_s; NULL when either count is NULL or the clock span is NULL or zero",
+    "hull_area": "area of the convex hull of the smoothed (nx, ny) points, neck-space units squared; 0 for < 3 points or collinear points",
+    "ellipse_area": "area of the 2-standard-deviation ellipse of the smoothed points, 4*pi*sqrt(lambda1*lambda2) of the coordinate covariance; 0 when a principal axis has no spread",
+    "bbox_area": "(nx_max - nx_min) * (ny_max - ny_min): area of the axis-aligned bounding box of the trajectory",
+    "scale-free intra-clip ratios (cv_speed, mean_over_max, t_peak_rel, early_late_speed_ratio)": ("dimensionless quotients of two statistics of the SAME clip; never a statistic normalized against other clips. t_peak_rel = time_to_peak_speed / duration_s, early_late_speed_ratio = early_speed_mean / late_speed_mean (both v1 columns). NULL when the clip has no sample above MOVEMENT_SPEED: a quotient of float dust is not a shape"),
+    "shape of the speed distribution (speed_skew, speed_kurtosis)": "Fisher-Pearson m3/m2^1.5 and excess m4/m2^2 - 3 over finite speed; NULL when fewer than 3 samples, when the variance is 0, or when the clip never exceeds MOVEMENT_SPEED",
+    "frac_speed_gt_0p5 / 1p0 / 2p0": "fraction of finite speed samples above ABSOLUTE thresholds of 0.5, 1.0 and 2.0 neck-space units/s (0.5 = MOVEMENT_SPEED, about the 55th percentile of the delivery corpus)",
+    "speed_sq_mean, speed_sq_sum": "mean and sum of speed^2, units^2/s^2 (specific kinetic energy is 0.5 * speed_sq_mean, J/kg only if a metre scale and a mass are supplied - they are not)",
+    "n_speed": "count of frames with a finite speed, the denominator every speed aggregate above divides by",
+    "longest_moving_s": "longest run of ADJACENT timed frames with speed > MOVEMENT_SPEED, measured as last minus first timestamp of the run",
+    "cos_phase_*": ("cosine of the angle between the right and left velocity vectors, in [-1, 1]: +1 same direction, -1 opposite. Only frames where BOTH hands exceed MOVEMENT_SPEED enter: two 1e-15 vectors have an undefined angle and would contribute uniform noise. n_cos_phase says how many frames that is - if it is small, the mean is thin"),
+    "frac_cos_gt_0p8, frac_cos_lt_m0p2": "fraction of those frames that are in-phase (> 0.8) or genuinely anti-phase (< -0.2)",
+    "coactivity_frac_0p5, coactivity_frac_1p0": "fraction of frames with BOTH hands valid and BOTH speeds above the absolute threshold, over frames where both speeds are measurable",
+    "coactivity_bout_*": "runs of adjacent timed frames satisfying coactivity; n is always a real count (0.0 = measured and none), mean/max are NULL when there is no bout and when fewer than MIN_STAT_SAMPLES frames had both speeds measurable",
+    "mirror_error_x_std, mirror_error_y_std": "sample std of the v1 per-frame mirror errors (|x_R + x_L| about the body midline, |y_R - y_L|)",
+    "abs_y_pair_sum_mean": "mean of |y_R + y_L| - the elevation-magnitude quantity, NOT a symmetry measure",
+    "pair_elevation_mean": "mean signed (y_R + y_L) / 2: height of the hand pair relative to the neck, positive above",
+    "bbox_area_wrists": "|x_R - x_L| * |y_R - y_L|: area of the axis-aligned rectangle having the two wrists as opposite corners; 0 whenever the wrists share an x or a y",
+    "NULL in the extended block": ("that measure had no finite sample in this clip, or fewer than "
+                                   "MIN_STAT_SAMPLES = 10 samples behind it. A NULL is not a 0, not a "
+                                   "small value, and not 'we looked and found nothing': read n_speed "
+                                   "and n_cos_phase for the denominator. 10 is a floor, not a claim "
+                                   "that a p95 is stable - filter on the published n for that"),
+}
+
+EXTENDED_SEMANTICS = {
+    "why there are no spatial bins": ("distance to the neck of a raised hand in this corpus spans p10=1.91 to "
+                                      "max=2.77 units, so any absolute ring saturates (frac > 3 units is 0 for every "
+                                      "clip) and any per-clip quartile ring is uniform by construction. Ring and "
+                                      "zone fractions were measured and dropped, not omitted by oversight."),
+    "why there is no cross-clip normalization": ("min-max or z-score against the whole clip set makes every feature "
+                                                 "dataset-dependent and leaks test clips into training scaling. "
+                                                 "Normalization belongs inside a CV pipeline, fit on train only."),
+    "why there is no phase-locking value": ("the longest usable contiguous run is about 150 frames (5 s) in 4 clips; "
+                                            "a Hilbert phase estimate on that is noise with decimals. Revisit with "
+                                            "longer clips and several clips per speaker."),
+    "bilateral columns": ("they need both wrists in the same frame. In the 29-clip delivery that is 4 clips; every "
+                          "other clip is NULL, and n_both_hands / n_cos_phase say how thin each number is."),
+}
+
+
+def feature_version(extended=False):
+    """Schema version of what compute_gesture_features will emit."""
+    return FEATURE_VERSION if extended else BASE_FEATURE_VERSION
+
+
+def sequence_columns(extended=False):
+    """Column list compute_gesture_features returns for sequence features."""
+    return SEQUENCE_COLUMNS + (EXTENDED_SEQUENCE_MEASURES if extended else ())
+
 
 SEMANTICS = {
     "reference_origin": ("BODY_25 point 1 (neck) as transformed by dfMaker; never the nose. X is "
@@ -470,6 +578,7 @@ def _hand_rows(nx_raw, ny_raw, conf, times, clock, observed, config):
     sx, sy = nx_usable.copy(), ny_usable.copy()
     velocity = {k: np.full(len(times), np.nan) for k in ("velocity_x", "velocity_y", "speed")}
     accel = {k: np.full(len(times), np.nan) for k in ("accel_x", "accel_y", "accel_magnitude")}
+    jerk = {k: np.full(len(times), np.nan) for k in EXTENDED_FRAME_MEASURES}
     step = np.full(len(times), np.nan)
 
     for start, stop in _runs(valid & clock):
@@ -485,6 +594,10 @@ def _hand_rows(nx_raw, ny_raw, conf, times, clock, observed, config):
         if ax is not None and ay is not None:
             accel["accel_x"][start:stop], accel["accel_y"][start:stop] = ax, ay
             accel["accel_magnitude"][start:stop] = np.hypot(ax, ay)
+        jx, jy = _derivative(smooth_x, run_t, 3), _derivative(smooth_y, run_t, 3)
+        if jx is not None and jy is not None:
+            jerk["jerk_x"][start:stop], jerk["jerk_y"][start:stop] = jx, jy
+            jerk["jerk_magnitude"][start:stop] = np.hypot(jx, jy)
 
     # Adjacent-frame displacement needs two neighbouring trusted coordinates, not
     # a clock, so path_length stays meaningful across a hole in the timestamps.
@@ -502,13 +615,15 @@ def _hand_rows(nx_raw, ny_raw, conf, times, clock, observed, config):
                 "velocity_x": velocity["velocity_x"], "velocity_y": velocity["velocity_y"],
                 "speed": velocity["speed"], "accel_x": accel["accel_x"], "accel_y": accel["accel_y"],
                 "accel_magnitude": accel["accel_magnitude"], "step_distance": step})
+    out.update(jerk)
     return out
 
 
-def _sequence_frame_rows(clip_id, people, grp, config):
+def _sequence_frame_rows(clip_id, people, grp, config, extended=False):
     """Every grid row of one (id, people_id) sequence as a list of dicts."""
     grid, times, clock, clock_inferred, observed = _sequence_grid(
         grp, f"sequence {clip_id} / person {people:g}", config)
+    measures = HAND_MEASURES + (EXTENDED_FRAME_MEASURES if extended else ())
     hands = {hand: _hand_rows(*_hand_arrays(grp, hand, len(grid), grid[0]),
                               times, clock, observed, config)
              for hand in ("right", "left")}
@@ -534,7 +649,7 @@ def _sequence_frame_rows(clip_id, people, grp, config):
                "frame_inferred": not bool(observed[i]), "clock_known": bool(clock[i]),
                "timestamp_inferred": bool(clock_inferred[i])}
         for hand in ("right", "left"):
-            for measure in HAND_MEASURES:
+            for measure in measures:
                 name = measure.split("(")[0]
                 row[f"{hand}_{name}"] = hands[hand][name][i]
         row.update({name: values[i] for name, values in pair.items()})
@@ -608,6 +723,285 @@ def _circular_stats(angles, zero_resultant=1e-12):
     return mean, math.sqrt(max(-2.0 * math.log(resultant), 0.0))
 
 
+def _std(values, ddof=1):
+    """Sample std, NULL for fewer than two samples (a single sample has no spread)."""
+    values = _finite(values)
+    return float(np.std(values, ddof=ddof)) if values.size >= 2 else np.nan
+
+
+def _percentile(values, q):
+    values = _finite(values)
+    return float(np.percentile(values, q)) if values.size else np.nan
+
+
+def _distribution_block(prefix, values):
+    """min / percentiles / max / std of one measure, over its finite samples only."""
+    values = _finite(values)
+    if values.size < MIN_STAT_SAMPLES:
+        return {f"{prefix}_{suffix}": np.nan
+                for suffix in ("min", "p05", "p25", "p50", "p75", "p95", "max", "std")}
+    block = {f"{prefix}_min": float(values.min()), f"{prefix}_max": float(values.max()),
+             f"{prefix}_std": _std(values)}
+    for q in (5, 25, 50, 75, 95):
+        block[f"{prefix}_p{q:02d}"] = float(np.percentile(values, q))
+    return block
+
+
+def _sign_changes(values):
+    """Count of sign changes across the given samples, or NULL for too few of them.
+
+    Exact zeros hold the previous sign instead of inventing a reversal, so a
+    hand that parks at x=0 does not look like it is shaking.
+    """
+    signs = np.sign(_finite(values))
+    signs = signs[signs != 0]
+    if signs.size < MIN_STAT_SAMPLES:
+        return np.nan
+    return float(np.count_nonzero(np.diff(signs)))
+
+
+def _convex_hull_area(x, y):
+    """Area of the convex hull (Andrew's monotone chain).
+
+    The sample floor counts FRAMES, not distinct positions: a hand parked in one
+    spot for 61 frames has a swept area of 0, which is a measurement, while 3
+    frames have not measured an area at all. Duplicates are removed with exact
+    equality, never rounding: rounding would turn a straight trajectory into a
+    thin fake polygon with a nonzero area.
+    """
+    x, y = _finite(x), _finite(y)
+    if x.size < MIN_STAT_SAMPLES:
+        return np.nan
+    points = np.unique(np.column_stack([x, y]), axis=0)
+    if len(points) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    chains = []
+    for order in (points, points[::-1]):
+        chain = []
+        for point in order:
+            while len(chain) >= 2 and cross(chain[-2], chain[-1], point) <= 0:
+                chain.pop()
+            chain.append(point)
+        chains.append(chain)
+    hull = np.array(chains[0][:-1] + chains[1][:-1])
+    if len(hull) < 3:
+        return 0.0
+    x_y = np.column_stack([hull[:, 0], hull[:, 1]])
+    return float(0.5 * abs(np.dot(x_y[:, 0], np.roll(x_y[:, 1], -1))
+                           - np.dot(x_y[:, 1], np.roll(x_y[:, 0], -1))))
+
+
+def _ellipse_area(x, y):
+    """Area of the 2-standard-deviation ellipse, 4*pi*sqrt(lambda1*lambda2).
+
+    rowvar=False because the columns are the variables: the rows are frames. The
+    floor counts frames: a position held for 61 frames encloses 0 area, which is
+    a measurement.
+    """
+    x, y = _finite(x), _finite(y)
+    if x.size < MIN_STAT_SAMPLES:
+        return np.nan
+    if x.size < 2:
+        return 0.0
+    covariance = np.cov(np.column_stack([x, y]), rowvar=False, ddof=1)
+    eigenvalues = np.clip(np.linalg.eigvalsh(np.atleast_2d(covariance)), 0.0, None)
+    return float(4.0 * math.pi * math.sqrt(float(eigenvalues.prod())))
+
+
+def _run_durations(mask, times, clock, frame_numbers):
+    """(n, mean_s, max_s) of runs of ADJACENT timed frames satisfying mask.
+
+    The count is always a real count: 0.0 means "measured, and there was no such
+    run", which is a measurement. mean/max are NULL when there is nothing to
+    average - never 0.0 seconds.
+    """
+    adjacent = np.concatenate(([True], np.diff(frame_numbers) == 1)) & np.concatenate(
+        ([True], clock[1:] & clock[:-1]))
+    durations = []
+    for start, stop in _runs(np.asarray(mask, dtype=bool) & np.asarray(clock, dtype=bool) & adjacent):
+        run = np.asarray(times, "float64")[start:stop]
+        run = run[np.isfinite(run)]
+        if run.size:
+            durations.append(float(run[-1] - run[0]))
+    if not durations:
+        return 0.0, np.nan, np.nan
+    return float(len(durations)), float(np.mean(durations)), float(np.max(durations))
+
+
+def _shape_moments(values):
+    """Fisher-Pearson skew and excess kurtosis; NULL when the shape is undefined."""
+    values = _finite(values)
+    if values.size < 3:
+        return np.nan, np.nan
+    centered = values - values.mean()
+    second = float((centered ** 2).mean())
+    if second <= 0.0:
+        return np.nan, np.nan
+    return (float((centered ** 3).mean() / second ** 1.5),
+            float((centered ** 4).mean() / second ** 2 - 3.0))
+
+
+def _hand_extended_summary(frames, hand, base):
+    """Per-hand aggregates that only look at this clip."""
+    out = {}
+
+    def column(name):
+        return frames[f"{hand}_{name}"].to_numpy("float64")
+
+    times = frames["frame_timestamp"].to_numpy("float64")
+    clock = frames["clock_known"].to_numpy("bool")
+    frame_numbers = frames["frame"].to_numpy("int64")
+    speed = _finite(column("speed"))
+    speed_arr = column("speed")
+    has_movement = bool(np.any(speed_arr > MOVEMENT_SPEED))
+    enough_speed = speed.size >= MIN_STAT_SAMPLES
+
+    for measure in _AGG_MEASURES:
+        out.update(_distribution_block(f"{hand}_{measure}", column(measure)))
+    for axis in ("nx", "ny"):
+        values = _finite(column(f"{axis}_smooth"))
+        enough = values.size >= MIN_STAT_SAMPLES
+        out[f"{hand}_{axis}_min"] = float(values.min()) if enough else np.nan
+        out[f"{hand}_{axis}_max"] = float(values.max()) if enough else np.nan
+        out[f"{hand}_{axis}_std"] = _std(values) if enough else np.nan
+
+    timed = clock & np.isfinite(times)
+    # A stationary hand still gets a derivative of order 1e-15 from the
+    # second-order edge formula, and that dust flips sign. A direction only
+    # counts where THAT component is measurable above MOVEMENT_SPEED, so a purely
+    # horizontal move reports reversals in x and NULL in y, never 0 fake flips.
+    def axis_reversals(component):
+        values = column(component)
+        return _sign_changes(values[timed & (np.abs(values) > MOVEMENT_SPEED)])
+
+    out[f"{hand}_reversals_x"] = axis_reversals("velocity_x")
+    out[f"{hand}_reversals_y"] = axis_reversals("velocity_y")
+    distance, frames_ahead = column("neck_distance"), np.diff(frame_numbers) == 1
+    pair_timed = frames_ahead & clock[1:] & clock[:-1]
+    dt = np.diff(times)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # A difference per STEP is not a rate: divide by the real elapsed time so
+        # this compares against a per-second threshold in the same units as speed.
+        radial = np.diff(distance) / dt
+    radial = np.where(pair_timed & np.isfinite(dt) & (dt > 0), radial, np.nan)
+    out[f"{hand}_reversals_radial"] = _sign_changes(radial[np.abs(radial) > MOVEMENT_SPEED])
+    duration = base.get("duration_s", np.nan)
+    reversals = [out[f"{hand}_reversals_x"], out[f"{hand}_reversals_y"]]
+    out[f"{hand}_reversals_per_s"] = (float(np.nansum(reversals)) / float(duration)
+                                      if np.isfinite(duration) and duration > 0
+                                      and np.any(np.isfinite(reversals)) else np.nan)
+
+    smooth_x, smooth_y = column("nx_smooth"), column("ny_smooth")
+    both_axes = np.isfinite(smooth_x) & np.isfinite(smooth_y)
+    if int(both_axes.sum()) >= MIN_STAT_SAMPLES:
+        out[f"{hand}_hull_area"] = _convex_hull_area(smooth_x[both_axes], smooth_y[both_axes])
+        out[f"{hand}_ellipse_area"] = _ellipse_area(smooth_x[both_axes], smooth_y[both_axes])
+        out[f"{hand}_bbox_area"] = (float(smooth_x[both_axes].max() - smooth_x[both_axes].min())
+                                    * float(smooth_y[both_axes].max() - smooth_y[both_axes].min()))
+    else:
+        out[f"{hand}_hull_area"] = out[f"{hand}_ellipse_area"] = out[f"{hand}_bbox_area"] = np.nan
+
+    mean_speed = float(speed.mean()) if speed.size else np.nan
+    max_speed = base.get(f"{hand}_max_speed", np.nan)
+    out[f"{hand}_cv_speed"] = (float(_std(speed) / mean_speed) if enough_speed and has_movement
+                               and np.isfinite(mean_speed) and mean_speed > 0 else np.nan)
+    out[f"{hand}_mean_over_max"] = (float(mean_speed / max_speed) if enough_speed
+                                    and np.isfinite(mean_speed) and np.isfinite(max_speed)
+                                    and max_speed > 0 else np.nan)
+    peak, duration = base.get(f"{hand}_time_to_peak_speed", np.nan), base.get("duration_s", np.nan)
+    out[f"{hand}_t_peak_rel"] = (float(peak / duration) if enough_speed and np.isfinite(peak)
+                                 and np.isfinite(duration) and duration > 0 else np.nan)
+    early, late = base.get(f"{hand}_early_speed_mean", np.nan), base.get(f"{hand}_late_speed_mean", np.nan)
+    out[f"{hand}_early_late_speed_ratio"] = (float(early / late) if enough_speed and has_movement
+                                             and np.isfinite(early) and np.isfinite(late)
+                                             and late > 0 else np.nan)
+    skew, kurtosis = _shape_moments(speed)
+    out[f"{hand}_speed_skew"] = skew if has_movement and enough_speed else np.nan
+    out[f"{hand}_speed_kurtosis"] = kurtosis if has_movement and enough_speed else np.nan
+
+    for threshold in _SPEED_THRESHOLDS:
+        name = f"{hand}_frac_speed_gt_{str(threshold).replace('.', 'p')}"
+        out[name] = float((speed > threshold).mean()) if enough_speed else np.nan
+    out[f"{hand}_speed_sq_mean"] = float((speed ** 2).mean()) if enough_speed else np.nan
+    out[f"{hand}_speed_sq_sum"] = float((speed ** 2).sum()) if enough_speed else np.nan
+    out[f"{hand}_n_speed"] = float(speed.size)
+    out[f"{hand}_longest_moving_s"] = (_run_durations(column("speed") > MOVEMENT_SPEED,
+                                                      times, clock, frame_numbers)[2]
+                                       if enough_speed else np.nan)
+    return out
+
+
+def _bilateral_extended_summary(frames):
+    """Two-hand measures. NULL in every clip where the two wrists are not both tracked."""
+    out = {}
+    times = frames["frame_timestamp"].to_numpy("float64")
+    clock = frames["clock_known"].to_numpy("bool")
+    frame_numbers = frames["frame"].to_numpy("int64")
+    vectors = {hand: (frames[f"{hand}_velocity_x"].to_numpy("float64"),
+                      frames[f"{hand}_velocity_y"].to_numpy("float64")) for hand in ("right", "left")}
+    speeds = {hand: frames[f"{hand}_speed"].to_numpy("float64") for hand in ("right", "left")}
+
+    rx, ry = vectors["right"]
+    lx, ly = vectors["left"]
+    moving = (np.isfinite(speeds["right"]) & (speeds["right"] > MOVEMENT_SPEED)
+              & np.isfinite(speeds["left"]) & (speeds["left"] > MOVEMENT_SPEED))
+    norm = np.hypot(rx, ry) * np.hypot(lx, ly)
+    usable = moving & np.isfinite(norm) & (norm > 0.0)
+    cos_phase = np.divide(rx * lx + ry * ly, norm, out=np.full(len(norm), np.nan), where=usable)
+    finite_cos = _finite(cos_phase)
+    out["n_cos_phase"] = float(finite_cos.size)
+    thin_cos = ["cos_phase_mean", "cos_phase_median", "cos_phase_std", "cos_phase_p05",
+                "cos_phase_p95", "frac_cos_gt_0p8", "frac_cos_lt_m0p2"]
+    if finite_cos.size >= MIN_STAT_SAMPLES:
+        out["cos_phase_mean"] = float(finite_cos.mean())
+        out["cos_phase_median"] = float(np.percentile(finite_cos, 50))
+        out["cos_phase_std"] = _std(finite_cos)
+        out["cos_phase_p05"] = float(np.percentile(finite_cos, 5))
+        out["cos_phase_p95"] = float(np.percentile(finite_cos, 95))
+        out["frac_cos_gt_0p8"] = float((finite_cos > 0.8).mean())
+        out["frac_cos_lt_m0p2"] = float((finite_cos < -0.2).mean())
+    else:
+        for name in thin_cos:
+            out[name] = np.nan
+
+    measurable = np.isfinite(speeds["right"]) & np.isfinite(speeds["left"])
+    enough_both = int(measurable.sum()) >= MIN_STAT_SAMPLES
+    active = {"0p5": measurable & (speeds["right"] > MOVEMENT_SPEED)
+                            & (speeds["left"] > MOVEMENT_SPEED),
+              "1p0": measurable & (speeds["right"] > 1.0) & (speeds["left"] > 1.0)}
+    for suffix, mask in active.items():
+        out[f"coactivity_frac_{suffix}"] = (float(mask[measurable].mean())
+                                            if enough_both else np.nan)
+    count, mean_s, max_s = _run_durations(active["0p5"], times, clock, frame_numbers)
+    out["coactivity_bout_n"] = count
+    out["coactivity_bout_mean_s"] = mean_s if enough_both else np.nan
+    out["coactivity_bout_max_s"] = max_s if enough_both else np.nan
+
+    for name, source in (("mirror_error_x_std", "mirror_error_x"),
+                         ("mirror_error_y_std", "mirror_error_y")):
+        values = _finite(frames[source].to_numpy("float64"))
+        out[name] = _std(values) if values.size >= MIN_STAT_SAMPLES else np.nan
+
+    both = frames["both_hands_valid"].to_numpy("bool")
+    sx = {hand: frames[f"{hand}_nx_smooth"].to_numpy("float64") for hand in ("right", "left")}
+    sy = {hand: frames[f"{hand}_ny_smooth"].to_numpy("float64") for hand in ("right", "left")}
+    paired = (both & np.isfinite(sx["right"]) & np.isfinite(sx["left"])
+              & np.isfinite(sy["right"]) & np.isfinite(sy["left"]))
+    if int(paired.sum()) >= MIN_STAT_SAMPLES:
+        y_sum = sy["right"][paired] + sy["left"][paired]
+        out["abs_y_pair_sum_mean"] = float(np.abs(y_sum).mean())
+        out["pair_elevation_mean"] = float((y_sum / 2.0).mean())
+        out["bbox_area_wrists"] = float((np.abs(sx["right"][paired] - sx["left"][paired])
+                                         * np.abs(sy["right"][paired] - sy["left"][paired])).mean())
+    else:
+        out["abs_y_pair_sum_mean"] = out["pair_elevation_mean"] = out["bbox_area_wrists"] = np.nan
+    return out
+
+
 def _hand_summary(frames, hand, frames_grid):
     def column(name):
         return frames[f"{hand}_{name}"].to_numpy("float64")
@@ -642,7 +1036,7 @@ def _hand_summary(frames, hand, frames_grid):
     }
 
 
-def _sequence_summary(clip_id, people, frames):
+def _sequence_summary(clip_id, people, frames, extended=False):
     times = frames["frame_timestamp"].to_numpy("float64")
     clock = frames["clock_known"].to_numpy("bool")
     both = frames["both_hands_valid"].to_numpy("bool")
@@ -670,41 +1064,58 @@ def _sequence_summary(clip_id, people, frames):
     }
     for hand in ("right", "left"):
         summary.update(_hand_summary(frames, hand, frames_grid))
+    if extended:
+        for hand in ("right", "left"):
+            summary.update(_hand_extended_summary(frames, hand, summary))
+        summary.update(_bilateral_extended_summary(frames))
     return summary
 
 
 # ----------------------------------------------------------------- public API ----
 
-def compute_gesture_features(wide_df, config=None):
+def compute_gesture_features(wide_df, config=None, extended=False):
     """Neck-relative wrist features for a wide per-frame table.
 
     Args:
         wide_df: rows of REQUIRED_WIDE_COLUMNS (never modified).
         config: GestureConfig, a mapping of GestureConfig parameters, or None.
+        extended: add the FEATURE_VERSION 3 block - jerk in the frame table and
+            per-clip distribution, shape, direction and two-hand aggregates in
+            the sequence table. Nothing in it looks at other clips.
 
     Returns:
-        (frame_features, sequence_features) DataFrames with FRAME_COLUMNS and
-        SEQUENCE_COLUMNS - the same schema even when nothing was measurable.
+        (frame_features, sequence_features) DataFrames with FRAME_COLUMNS
+        (+EXTENDED_FRAME_COLUMNS) and SEQUENCE_COLUMNS (+EXTENDED_SEQUENCE_MEASURES)
+        - the same schema even when nothing was measurable.
     """
     cfg = config if isinstance(config, GestureConfig) else GestureConfig.from_input(config)
     df = _validate_input(wide_df)
+    frame_columns = FRAME_COLUMNS + (EXTENDED_FRAME_COLUMNS if extended else ())
+    seq_columns = sequence_columns(extended)
 
     records = []
     for (clip_id, people), grp in df.groupby(["id", "people_id"], sort=True):
-        records.extend(_sequence_frame_rows(clip_id, people, grp, cfg))
+        records.extend(_sequence_frame_rows(clip_id, people, grp, cfg, extended=extended))
 
-    frames = _typed_frame(pd.DataFrame(records, columns=list(FRAME_COLUMNS)))
+    frames = _typed_frame(pd.DataFrame(records, columns=list(frame_columns)),
+                          extended=extended)
     if frames.empty:
-        return frames, _typed_frame(pd.DataFrame(columns=list(SEQUENCE_COLUMNS)), sequence=True)
+        return frames, _typed_frame(pd.DataFrame(columns=list(seq_columns)),
+                                    sequence=True, extended=extended)
 
-    summaries = [_sequence_summary(clip_id, people, grp)
+    summaries = [_sequence_summary(clip_id, people, grp, extended=extended)
                  for (clip_id, people), grp in frames.groupby(["id", "people_id"], sort=True)]
-    return frames, _typed_frame(pd.DataFrame(summaries, columns=list(SEQUENCE_COLUMNS)), sequence=True)
+    return frames, _typed_frame(pd.DataFrame(summaries, columns=list(seq_columns)),
+                                sequence=True, extended=extended)
 
 
-def _typed_frame(df, sequence=False):
+def _typed_frame(df, sequence=False, extended=False):
     """Fixed dtypes: float64 features (NULL = NaN), nullable bool, int64 frame."""
-    out = pd.DataFrame(index=range(len(df)), columns=list(SEQUENCE_COLUMNS if sequence else FRAME_COLUMNS))
+    if sequence:
+        columns = list(sequence_columns(extended))
+    else:
+        columns = list(FRAME_COLUMNS + (EXTENDED_FRAME_COLUMNS if extended else ()))
+    out = pd.DataFrame(index=range(len(df)), columns=columns)
     for name in out.columns:
         values = df[name].to_numpy(dtype=object) if len(df) else np.empty(0, dtype=object)
         if name == "id":
